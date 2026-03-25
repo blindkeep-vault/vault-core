@@ -103,13 +103,14 @@ pub fn encrypt_item(
         aead::{Aead, KeyInit},
         XChaCha20Poly1305, XNonce,
     };
+    use rand::rngs::OsRng;
     use rand::RngCore;
 
     let cipher =
         XChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::InvalidKeyLength)?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -157,7 +158,7 @@ pub fn wrap_key_for_recipient(
     use sha2::Sha256;
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
-    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
+    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
 
     let recipient_pk = PublicKey::from(*recipient_public_key);
@@ -243,13 +244,14 @@ pub fn encrypt_item_v1(
         aead::{Aead, KeyInit, Payload},
         XChaCha20Poly1305, XNonce,
     };
+    use rand::rngs::OsRng;
     use rand::RngCore;
 
     let cipher =
         XChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::InvalidKeyLength)?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -325,7 +327,7 @@ pub fn wrap_key_for_recipient_v1(
     use sha2::Sha256;
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
-    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
+    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
 
     let recipient_pk = PublicKey::from(*recipient_public_key);
