@@ -519,7 +519,7 @@ mod tests {
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let item_key = [99u8; 32];
-        let recipient_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let recipient_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
         let recipient_public = PublicKey::from(&recipient_secret);
 
         let wrapped = wrap_key_for_recipient_v1(&item_key, recipient_public.as_bytes()).unwrap();
@@ -542,7 +542,7 @@ mod tests {
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let item_key = [77u8; 32];
-        let recipient_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let recipient_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
         let recipient_public = PublicKey::from(&recipient_secret);
 
         let wrapped = wrap_key_for_recipient(&item_key, recipient_public.as_bytes()).unwrap();
