@@ -397,6 +397,69 @@ pub fn unwrap_key_v1(
     Ok(key)
 }
 
+/// Generate a random X25519 keypair.
+/// Returns (private_key, public_key) both as 32-byte arrays.
+pub fn generate_x25519_keypair() -> ([u8; KEY_LEN], [u8; PUBKEY_LEN]) {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let public = PublicKey::from(&secret);
+    (secret.to_bytes(), *public.as_bytes())
+}
+
+/// Derive a wrapping key and auth key from an API key secret using HKDF-SHA256.
+/// Returns (wrapping_key, auth_key) both as 32-byte arrays.
+pub fn derive_api_key_keys(
+    secret: &[u8; KEY_LEN],
+) -> Result<([u8; KEY_LEN], [u8; KEY_LEN]), CryptoError> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    let hkdf = Hkdf::<Sha256>::new(Some(b"vault-apikey"), secret);
+
+    let mut wrapping_key = [0u8; KEY_LEN];
+    hkdf.expand(b"wrap", &mut wrapping_key)
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+
+    let mut auth_key = [0u8; KEY_LEN];
+    hkdf.expand(b"auth", &mut auth_key)
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+
+    Ok((wrapping_key, auth_key))
+}
+
+/// Wrap a master key with a symmetric wrapping key (for API key storage).
+/// Returns nonce(24) || ciphertext concatenated.
+pub fn wrap_master_key(
+    wrapping_key: &[u8; KEY_LEN],
+    master_key: &MasterKey,
+) -> Result<Vec<u8>, CryptoError> {
+    let enc = encrypt_item(wrapping_key, master_key.as_bytes())?;
+    let mut out = Vec::with_capacity(NONCE_LEN + enc.ciphertext.len());
+    out.extend_from_slice(&enc.nonce);
+    out.extend_from_slice(&enc.ciphertext);
+    Ok(out)
+}
+
+/// Unwrap a master key from API key wrapped form.
+/// Input is nonce(24) || ciphertext.
+pub fn unwrap_master_key(
+    wrapping_key: &[u8; KEY_LEN],
+    wrapped: &[u8],
+) -> Result<MasterKey, CryptoError> {
+    if wrapped.len() < NONCE_LEN + 1 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let nonce = &wrapped[..NONCE_LEN];
+    let ciphertext = &wrapped[NONCE_LEN..];
+    let plaintext = decrypt_item(wrapping_key, ciphertext, nonce)?;
+    if plaintext.len() != KEY_LEN {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    let mut bytes = [0u8; KEY_LEN];
+    bytes.copy_from_slice(&plaintext);
+    Ok(MasterKey::from_bytes(bytes))
+}
+
 /// Verify an Ed25519 notarization signature.
 /// Message format: content_hash(32) || timestamp_millis(8, BE) || tree_root(32).
 /// Uses verify_strict to reject malleable (non-canonical) signatures.
@@ -716,6 +779,60 @@ mod tests {
             &tree_root,
             &sig.to_bytes(),
         ));
+    }
+
+    #[test]
+    fn api_key_derive_deterministic() {
+        let secret = [42u8; 32];
+        let (w1, a1) = derive_api_key_keys(&secret).unwrap();
+        let (w2, a2) = derive_api_key_keys(&secret).unwrap();
+        assert_eq!(w1, w2);
+        assert_eq!(a1, a2);
+    }
+
+    #[test]
+    fn api_key_wrapping_and_auth_keys_differ() {
+        let secret = [42u8; 32];
+        let (wrapping, auth) = derive_api_key_keys(&secret).unwrap();
+        assert_ne!(wrapping, auth);
+    }
+
+    #[test]
+    fn api_key_different_secrets_different_keys() {
+        let (w1, a1) = derive_api_key_keys(&[1u8; 32]).unwrap();
+        let (w2, a2) = derive_api_key_keys(&[2u8; 32]).unwrap();
+        assert_ne!(w1, w2);
+        assert_ne!(a1, a2);
+    }
+
+    #[test]
+    fn wrap_unwrap_master_key_roundtrip() {
+        let secret = [42u8; 32];
+        let (wrapping_key, _) = derive_api_key_keys(&secret).unwrap();
+        let master = MasterKey::from_bytes([99u8; 32]);
+
+        let wrapped = wrap_master_key(&wrapping_key, &master).unwrap();
+        let unwrapped = unwrap_master_key(&wrapping_key, &wrapped).unwrap();
+
+        assert_eq!(unwrapped.as_bytes(), master.as_bytes());
+    }
+
+    #[test]
+    fn unwrap_master_key_wrong_key_fails() {
+        let secret = [42u8; 32];
+        let (wrapping_key, _) = derive_api_key_keys(&secret).unwrap();
+        let master = MasterKey::from_bytes([99u8; 32]);
+
+        let wrapped = wrap_master_key(&wrapping_key, &master).unwrap();
+
+        let wrong_key = [0u8; 32];
+        assert!(unwrap_master_key(&wrong_key, &wrapped).is_err());
+    }
+
+    #[test]
+    fn unwrap_master_key_truncated_input_fails() {
+        assert!(unwrap_master_key(&[0u8; 32], &[0u8; 10]).is_err());
+        assert!(unwrap_master_key(&[0u8; 32], &[]).is_err());
     }
 
     #[test]
