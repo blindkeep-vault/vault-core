@@ -466,6 +466,7 @@ pub fn unwrap_master_key(
 pub fn verify_notarization_signature(
     public_key: &[u8; PUBKEY_LEN],
     content_hash: &[u8; PUBKEY_LEN],
+    blob_hash: Option<&[u8; 32]>,
     timestamp_millis: i64,
     tree_root: &[u8; PUBKEY_LEN],
     signature: &[u8; 64],
@@ -477,8 +478,9 @@ pub fn verify_notarization_signature(
         Err(_) => return false,
     };
 
-    let mut msg = Vec::with_capacity(72);
+    let mut msg = Vec::with_capacity(104);
     msg.extend_from_slice(content_hash);
+    msg.extend_from_slice(blob_hash.unwrap_or(&[0u8; 32]));
     msg.extend_from_slice(&timestamp_millis.to_be_bytes());
     msg.extend_from_slice(tree_root);
 
@@ -733,12 +735,14 @@ mod tests {
 
         let key = SigningKey::from_bytes(&[42u8; 32]);
         let content_hash = [0xAB; 32];
+        let blob_hash = [0xEF; 32];
         let timestamp = 1_700_000_000_000i64;
         let tree_root = [0xCD; 32];
 
-        // Build signature manually matching the function's format
-        let mut msg = Vec::with_capacity(72);
+        // Build signature manually matching the function's 104-byte format
+        let mut msg = Vec::with_capacity(104);
         msg.extend_from_slice(&content_hash);
+        msg.extend_from_slice(&blob_hash);
         msg.extend_from_slice(&timestamp.to_be_bytes());
         msg.extend_from_slice(&tree_root);
 
@@ -748,6 +752,36 @@ mod tests {
         assert!(verify_notarization_signature(
             &key.verifying_key().to_bytes(),
             &content_hash,
+            Some(&blob_hash),
+            timestamp,
+            &tree_root,
+            &sig.to_bytes(),
+        ));
+    }
+
+    #[test]
+    fn verify_notarization_signature_roundtrip_no_blob() {
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let content_hash = [0xAB; 32];
+        let timestamp = 1_700_000_000_000i64;
+        let tree_root = [0xCD; 32];
+
+        // None blob_hash uses 32 zero bytes
+        let mut msg = Vec::with_capacity(104);
+        msg.extend_from_slice(&content_hash);
+        msg.extend_from_slice(&[0u8; 32]);
+        msg.extend_from_slice(&timestamp.to_be_bytes());
+        msg.extend_from_slice(&tree_root);
+
+        use ed25519_dalek::Signer;
+        let sig = key.sign(&msg);
+
+        assert!(verify_notarization_signature(
+            &key.verifying_key().to_bytes(),
+            &content_hash,
+            None,
             timestamp,
             &tree_root,
             &sig.to_bytes(),
@@ -764,8 +798,9 @@ mod tests {
         let timestamp = 1000i64;
         let tree_root = [0xCD; 32];
 
-        let mut msg = Vec::with_capacity(72);
+        let mut msg = Vec::with_capacity(104);
         msg.extend_from_slice(&content_hash);
+        msg.extend_from_slice(&[0u8; 32]);
         msg.extend_from_slice(&timestamp.to_be_bytes());
         msg.extend_from_slice(&tree_root);
 
@@ -775,6 +810,7 @@ mod tests {
         assert!(!verify_notarization_signature(
             &other_key.verifying_key().to_bytes(),
             &content_hash,
+            None,
             timestamp,
             &tree_root,
             &sig.to_bytes(),
