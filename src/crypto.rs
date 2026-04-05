@@ -397,6 +397,63 @@ pub fn unwrap_key_v1(
     Ok(key)
 }
 
+/// Wrap an item key for a grant recipient using V1 key-bound wrapping.
+/// Returns the grant-format wrapped key (nonce(24) || ciphertext) and the ephemeral public key.
+/// This is the canonical way to wrap a key for user-to-user grants.
+pub fn wrap_key_for_grant(
+    item_key: &[u8; KEY_LEN],
+    recipient_public_key: &[u8; PUBKEY_LEN],
+) -> Result<(Vec<u8>, [u8; PUBKEY_LEN]), CryptoError> {
+    let wrapped = wrap_key_for_recipient_v1(item_key, recipient_public_key)?;
+    let mut grant_key = Vec::with_capacity(NONCE_LEN + wrapped.wrapped_key.len());
+    grant_key.extend_from_slice(&wrapped.nonce);
+    grant_key.extend_from_slice(&wrapped.wrapped_key);
+    Ok((grant_key, wrapped.ephemeral_pubkey))
+}
+
+/// Unwrap a grant-format wrapped key (nonce(24) || ciphertext).
+/// Uses V1 key-bound unwrapping. `recipient_public_key` is required to reconstruct the HKDF salt.
+pub fn unwrap_grant_key(
+    recipient_private_key: &[u8; KEY_LEN],
+    ephemeral_pubkey: &[u8; PUBKEY_LEN],
+    grant_wrapped_key: &[u8],
+    recipient_public_key: &[u8; PUBKEY_LEN],
+) -> Result<[u8; KEY_LEN], CryptoError> {
+    if grant_wrapped_key.len() < NONCE_LEN + 1 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let nonce = &grant_wrapped_key[..NONCE_LEN];
+    let ciphertext = &grant_wrapped_key[NONCE_LEN..];
+
+    unwrap_key_v1(
+        recipient_private_key,
+        ephemeral_pubkey,
+        ciphertext,
+        nonce,
+        recipient_public_key,
+    )
+}
+
+/// Decrypt a user's private key from the stored format (nonce(24) || ciphertext).
+/// The `enc_key` is typically derived via `derive_subkey(master_key, b"encrypt")`.
+pub fn decrypt_private_key(
+    enc_key: &[u8; KEY_LEN],
+    encrypted_private_key: &[u8],
+) -> Result<[u8; KEY_LEN], CryptoError> {
+    if encrypted_private_key.len() < NONCE_LEN + 1 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let nonce = &encrypted_private_key[..NONCE_LEN];
+    let ciphertext = &encrypted_private_key[NONCE_LEN..];
+    let plaintext = decrypt_item(enc_key, ciphertext, nonce)?;
+    if plaintext.len() != KEY_LEN {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&plaintext);
+    Ok(key)
+}
+
 /// Generate a random X25519 keypair.
 /// Returns (private_key, public_key) both as 32-byte arrays.
 pub fn generate_x25519_keypair() -> ([u8; KEY_LEN], [u8; PUBKEY_LEN]) {
@@ -879,5 +936,70 @@ mod tests {
         // After drop, the memory should be zeroed (we can't test this directly
         // without unsafe, but we verify the type implements Zeroize)
         drop(key);
+    }
+
+    #[test]
+    fn wrap_unwrap_grant_key_roundtrip() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let item_key = [55u8; 32];
+        let recipient_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let recipient_public = PublicKey::from(&recipient_secret);
+
+        let (grant_wrapped_key, ephemeral_pubkey) =
+            wrap_key_for_grant(&item_key, recipient_public.as_bytes()).unwrap();
+
+        // Verify format: nonce(24) || 0x01 || ciphertext
+        assert!(grant_wrapped_key.len() > NONCE_LEN);
+        assert_eq!(grant_wrapped_key[NONCE_LEN], CIPHERTEXT_V1);
+
+        let unwrapped = unwrap_grant_key(
+            &recipient_secret.to_bytes(),
+            &ephemeral_pubkey,
+            &grant_wrapped_key,
+            recipient_public.as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(unwrapped, item_key);
+    }
+
+    #[test]
+    fn unwrap_grant_key_truncated_fails() {
+        assert!(unwrap_grant_key(&[0u8; 32], &[0u8; 32], &[0u8; 10], &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn decrypt_private_key_roundtrip() {
+        let enc_key = [42u8; 32];
+        let private_key = [77u8; 32];
+
+        // Encrypt in nonce || ciphertext format
+        let encrypted = encrypt_item(&enc_key, &private_key).unwrap();
+        let mut stored = Vec::new();
+        stored.extend_from_slice(&encrypted.nonce);
+        stored.extend_from_slice(&encrypted.ciphertext);
+
+        let decrypted = decrypt_private_key(&enc_key, &stored).unwrap();
+        assert_eq!(decrypted, private_key);
+    }
+
+    #[test]
+    fn decrypt_private_key_truncated_fails() {
+        assert!(decrypt_private_key(&[0u8; 32], &[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn decrypt_private_key_wrong_key_fails() {
+        let enc_key = [42u8; 32];
+        let private_key = [77u8; 32];
+
+        let encrypted = encrypt_item(&enc_key, &private_key).unwrap();
+        let mut stored = Vec::new();
+        stored.extend_from_slice(&encrypted.nonce);
+        stored.extend_from_slice(&encrypted.ciphertext);
+
+        let wrong_key = [99u8; 32];
+        assert!(decrypt_private_key(&wrong_key, &stored).is_err());
     }
 }
