@@ -1,64 +1,56 @@
 # vault-core
 
-Zero-knowledge cryptographic primitives for [BlindKeep](https://blindkeep.com) Vault.
+Zero-knowledge cryptographic primitives for the [BlindKeep](https://blindkeep.com) vault ecosystem. This crate provides all client-side encryption, key derivation, and protocol logic shared across vault-cli, vault-wasm, vault-mobile, and vault-api.
 
-All encryption and key management happens client-side. The server never sees plaintext data or master keys.
+## Cryptographic primitives
 
-## Primitives
+| Primitive | Usage |
+|-----------|-------|
+| **XChaCha20-Poly1305** | AEAD encryption for items and files |
+| **Argon2id** | Password-based key derivation (64 MiB, 3 iterations) |
+| **HKDF-SHA256** | Subkey derivation (encryption, wrapping, grants) |
+| **X25519** | Ephemeral key exchange for grant sharing |
+| **Ed25519** | Notarization signatures (strict verification) |
+| **PBKDF2-HMAC-SHA512** | Drop wrapping key derivation (600k iterations) |
+| **BIP39** | Mnemonic generation for drops |
 
-| Function | Algorithm | Purpose |
-|---|---|---|
-| `derive_master_key` | Argon2id (64 MiB, 3 iter) | Password to master key |
-| `derive_subkey` | HKDF-SHA256 | Master key to purpose-specific subkeys |
-| `encrypt_item` / `decrypt_item` | XChaCha20-Poly1305 | Authenticated encryption with 24-byte nonces |
-| `wrap_key_for_recipient` / `unwrap_key` | X25519 + HKDF + XChaCha20-Poly1305 | Asymmetric key wrapping for grant sharing |
+## Modules
 
-## Policy Engine
+- **`crypto`** -- Master key derivation, item encryption/decryption (V0/V1 with AAD), key wrapping for recipients and grants, X25519 keypair generation, Ed25519 signing
+- **`envelope`** -- SecretBlob serialization, inline envelope decryption, version-aware blob handling
+- **`unlock`** -- API key parsing (`vk_PREFIX_SECRET`), master key unwrapping from encrypted storage (V0/V1 auto-detection)
+- **`drops`** -- BIP39 mnemonic generation, drop lookup key derivation, wrapping key derivation, drop key wrap/unwrap
+- **`padding`** -- Random-padded bucket sizing to prevent length-based traffic analysis
+- **`policy`** -- Grant access policies (TTL, max views, allowed operations, IP allowlists)
+- **`storage`** -- S3-compatible storage abstraction
+- **`types`** -- Shared domain types (User, Item, Grant, AuditEntry)
 
-The `Policy` struct controls access to shared grants:
+### Feature flags
 
-- Absolute expiry (`expires_at`)
-- TTL from first access (`ttl_seconds`)
-- View count limits (`max_views`)
-- Operation allowlists (`allowed_ops`)
-- IP allowlists with CIDR support (`ip_allowlist`)
+| Feature | Enables |
+|---------|---------|
+| `drops` | BIP39 mnemonic, PBKDF2 drop key derivation |
+| `server` | JWT auth (`auth` module), Argon2 hash verification (`hashing` module), HTTP network helpers |
 
-## Build
+## Security properties
 
-```bash
-cargo build
-cargo test
-```
-
-Requires Rust 1.70+.
+- All key-returning functions use `Zeroizing<[u8; 32]>` wrappers to clear key material from memory on drop
+- `MasterKey` implements `Zeroize` with `#[zeroize(drop)]`
+- `OsRng` used exclusively for all randomness (no `thread_rng`)
+- Low-order X25519 point rejection (all-zero shared secret check)
+- JWT algorithm pinned to HS256 to prevent confusion attacks
+- V1 ciphertext format binds AAD (user ID, context) to prevent ciphertext relocation
 
 ## Usage
-
-Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 vault-core = { git = "ssh://git@github.com/blindkeep-vault/vault-core.git" }
-```
 
-```rust
-use vault_core::crypto::{derive_master_key, encrypt_item, decrypt_item};
-
-// Derive a master key from a password
-let master = derive_master_key(b"password", b"salt-at-least-16b").unwrap();
-
-// Encrypt
-let payload = encrypt_item(master.as_bytes(), b"secret data").unwrap();
-
-// Decrypt
-let plaintext = decrypt_item(master.as_bytes(), &payload.ciphertext, &payload.nonce).unwrap();
-assert_eq!(plaintext, b"secret data");
+# With drops support
+vault-core = { git = "ssh://git@github.com/blindkeep-vault/vault-core.git", features = ["drops"] }
 ```
 
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT), at your option.
-
-## Acknowledgments
-
-- **Maarten Boone** — Cryptographic review
