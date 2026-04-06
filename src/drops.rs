@@ -1,6 +1,7 @@
 use hkdf::Hkdf;
 use hmac::Hmac;
 use sha2::{Sha256, Sha512};
+use zeroize::Zeroizing;
 
 use crate::crypto::{decrypt_item, encrypt_item, CryptoError};
 
@@ -23,10 +24,10 @@ pub fn derive_drop_lookup_key(mnemonic: &str) -> String {
 
 /// Derive a 32-byte wrapping key from a mnemonic using PBKDF2-HMAC-SHA512.
 /// v1: 2048 iterations, v2+: 600,000 iterations.
-pub fn derive_drop_wrapping_key(mnemonic: &str, version: i32) -> [u8; 32] {
+pub fn derive_drop_wrapping_key(mnemonic: &str, version: i32) -> Zeroizing<[u8; 32]> {
     let iterations = if version >= 2 { 600_000 } else { 2048 };
-    let mut out = [0u8; 32];
-    pbkdf2::pbkdf2::<Hmac<Sha512>>(mnemonic.as_bytes(), b"vault-drop", iterations, &mut out)
+    let mut out = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2::<Hmac<Sha512>>(mnemonic.as_bytes(), b"vault-drop", iterations, out.as_mut())
         .expect("PBKDF2 failed");
     out
 }
@@ -41,7 +42,10 @@ pub fn wrap_drop_key(wrapping_key: &[u8; 32], drop_key: &[u8; 32]) -> Result<Vec
 }
 
 /// Unwrap a drop key from nonce(24) || ciphertext format.
-pub fn unwrap_drop_key(wrapping_key: &[u8; 32], wrapped: &[u8]) -> Result<[u8; 32], CryptoError> {
+pub fn unwrap_drop_key(
+    wrapping_key: &[u8; 32],
+    wrapped: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     if wrapped.len() < 25 {
         return Err(CryptoError::InvalidKeyLength);
     }
@@ -51,7 +55,7 @@ pub fn unwrap_drop_key(wrapping_key: &[u8; 32], wrapped: &[u8]) -> Result<[u8; 3
     if plain.len() != 32 {
         return Err(CryptoError::InvalidKeyLength);
     }
-    let mut bytes = [0u8; 32];
+    let mut bytes = Zeroizing::new([0u8; 32]);
     bytes.copy_from_slice(&plain);
     Ok(bytes)
 }
@@ -105,7 +109,7 @@ mod tests {
         let drop_key = [0xABu8; 32];
         let wrapped = wrap_drop_key(&wrapping_key, &drop_key).unwrap();
         let recovered = unwrap_drop_key(&wrapping_key, &wrapped).unwrap();
-        assert_eq!(recovered, drop_key);
+        assert_eq!(*recovered, drop_key);
     }
 
     #[test]

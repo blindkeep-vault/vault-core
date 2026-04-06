@@ -22,3 +22,4 @@ pub use crypto::{
 };
 pub use policy::Policy;
 pub use types::{AuditEntry, Grant, GrantStatus, Item, ItemType, User};
+pub use zeroize::Zeroizing;

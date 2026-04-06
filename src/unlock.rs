@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use zeroize::Zeroizing;
 
 use crate::crypto::{decrypt_item, decrypt_item_auto, derive_subkey, CryptoError, MasterKey};
 
@@ -15,19 +16,22 @@ pub enum ApiKeyError {
 
 /// Parse a `vk_PREFIX_SECRET` API key string.
 /// Returns `(prefix_with_vk, 32-byte secret)`.
-pub fn parse_api_key(raw_key: &str) -> Result<(String, [u8; 32]), ApiKeyError> {
+pub fn parse_api_key(raw_key: &str) -> Result<(String, Zeroizing<[u8; 32]>), ApiKeyError> {
     let parts: Vec<&str> = raw_key.splitn(3, '_').collect();
     if parts.len() != 3 || parts[0] != "vk" {
         return Err(ApiKeyError::InvalidFormat);
     }
     let prefix = format!("vk_{}", parts[1]);
-    let secret_bytes = URL_SAFE_NO_PAD
-        .decode(parts[2])
-        .map_err(|e| ApiKeyError::InvalidEncoding(e.to_string()))?;
+    let secret_bytes = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .map_err(|e| ApiKeyError::InvalidEncoding(e.to_string()))?,
+    );
     if secret_bytes.len() != 32 {
         return Err(ApiKeyError::InvalidSecretLength);
     }
-    Ok((prefix, secret_bytes.try_into().unwrap()))
+    let arr: [u8; 32] = secret_bytes[..].try_into().unwrap();
+    Ok((prefix, Zeroizing::new(arr)))
 }
 
 /// Unwrap a master key from its encrypted form.
@@ -98,7 +102,7 @@ mod tests {
         let raw = format!("vk_test_{}", encoded);
         let (prefix, parsed_secret) = parse_api_key(&raw).unwrap();
         assert_eq!(prefix, "vk_test");
-        assert_eq!(parsed_secret, secret);
+        assert_eq!(*parsed_secret, secret);
     }
 
     #[test]

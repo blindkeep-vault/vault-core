@@ -83,13 +83,16 @@ pub fn derive_master_key_legacy(password: &[u8], salt: &[u8]) -> Result<MasterKe
 }
 
 /// Derive a subkey from a master key using HKDF-SHA256.
-pub fn derive_subkey(master: &MasterKey, info: &[u8]) -> Result<[u8; KEY_LEN], CryptoError> {
+pub fn derive_subkey(
+    master: &MasterKey,
+    info: &[u8],
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
     let hkdf = Hkdf::<Sha256>::new(None, master.as_bytes());
-    let mut subkey = [0u8; KEY_LEN];
-    hkdf.expand(info, &mut subkey)
+    let mut subkey = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(info, subkey.as_mut())
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
     Ok(subkey)
 }
@@ -189,7 +192,7 @@ pub fn unwrap_key(
     ephemeral_pubkey: &[u8; PUBKEY_LEN],
     wrapped_key: &[u8],
     nonce: &[u8],
-) -> Result<[u8; KEY_LEN], CryptoError> {
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
     use x25519_dalek::{PublicKey, StaticSecret};
@@ -212,7 +215,7 @@ pub fn unwrap_key(
         return Err(CryptoError::InvalidKeyLength);
     }
 
-    let mut key = [0u8; KEY_LEN];
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
     key.copy_from_slice(&plaintext);
     Ok(key)
 }
@@ -222,13 +225,13 @@ pub fn derive_subkey_salted(
     master: &MasterKey,
     salt: &[u8],
     info: &[u8],
-) -> Result<[u8; KEY_LEN], CryptoError> {
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
     let hkdf = Hkdf::<Sha256>::new(Some(salt), master.as_bytes());
-    let mut subkey = [0u8; KEY_LEN];
-    hkdf.expand(info, &mut subkey)
+    let mut subkey = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(info, subkey.as_mut())
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
     Ok(subkey)
 }
@@ -439,7 +442,7 @@ pub fn unwrap_grant_key(
 pub fn decrypt_private_key(
     enc_key: &[u8; KEY_LEN],
     encrypted_private_key: &[u8],
-) -> Result<[u8; KEY_LEN], CryptoError> {
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
     if encrypted_private_key.len() < NONCE_LEN + 1 {
         return Err(CryptoError::DecryptionFailed);
     }
@@ -449,7 +452,7 @@ pub fn decrypt_private_key(
     if plaintext.len() != KEY_LEN {
         return Err(CryptoError::InvalidKeyLength);
     }
-    let mut key = [0u8; KEY_LEN];
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
     key.copy_from_slice(&plaintext);
     Ok(key)
 }
@@ -465,20 +468,21 @@ pub fn generate_x25519_keypair() -> ([u8; KEY_LEN], [u8; PUBKEY_LEN]) {
 
 /// Derive a wrapping key and auth key from an API key secret using HKDF-SHA256.
 /// Returns (wrapping_key, auth_key) both as 32-byte arrays.
+#[allow(clippy::type_complexity)]
 pub fn derive_api_key_keys(
     secret: &[u8; KEY_LEN],
-) -> Result<([u8; KEY_LEN], [u8; KEY_LEN]), CryptoError> {
+) -> Result<(Zeroizing<[u8; KEY_LEN]>, Zeroizing<[u8; KEY_LEN]>), CryptoError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
     let hkdf = Hkdf::<Sha256>::new(Some(b"vault-apikey"), secret);
 
-    let mut wrapping_key = [0u8; KEY_LEN];
-    hkdf.expand(b"wrap", &mut wrapping_key)
+    let mut wrapping_key = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(b"wrap", wrapping_key.as_mut())
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
 
-    let mut auth_key = [0u8; KEY_LEN];
-    hkdf.expand(b"auth", &mut auth_key)
+    let mut auth_key = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(b"auth", auth_key.as_mut())
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
 
     Ok((wrapping_key, auth_key))
@@ -677,7 +681,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(unwrapped, item_key);
+        assert_eq!(*unwrapped, item_key);
     }
 
     #[test]
@@ -981,7 +985,7 @@ mod tests {
         stored.extend_from_slice(&encrypted.ciphertext);
 
         let decrypted = decrypt_private_key(&enc_key, &stored).unwrap();
-        assert_eq!(decrypted, private_key);
+        assert_eq!(*decrypted, private_key);
     }
 
     #[test]
