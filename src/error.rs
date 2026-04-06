@@ -36,6 +36,7 @@ impl From<argon2::password_hash::Error> for ApiError {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<jsonwebtoken::errors::Error> for ApiError {
     fn from(err: jsonwebtoken::errors::Error) -> Self {
         ApiError::Internal(err.to_string())

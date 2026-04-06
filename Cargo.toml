@@ -23,8 +23,9 @@ thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"], optional = true }
 
 [features]
-default = ["drops"]
+default = ["drops", "server"]
 drops = ["dep:bip39", "dep:hex", "dep:hmac", "dep:pbkdf2"]
+server = ["dep:jsonwebtoken"]

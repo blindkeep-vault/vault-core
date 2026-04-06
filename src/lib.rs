@@ -1,10 +1,13 @@
+#[cfg(feature = "server")]
 pub mod auth;
 pub mod crypto;
 #[cfg(feature = "drops")]
 pub mod drops;
 pub mod envelope;
 pub mod error;
+#[cfg(feature = "server")]
 pub mod hashing;
+#[cfg(feature = "server")]
 pub mod network;
 pub mod padding;
 pub mod policy;
