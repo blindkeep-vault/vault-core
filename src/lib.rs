@@ -1,12 +1,17 @@
 pub mod auth;
 pub mod crypto;
+#[cfg(feature = "drops")]
+pub mod drops;
+pub mod envelope;
 pub mod error;
 pub mod hashing;
 pub mod network;
+pub mod padding;
 pub mod policy;
 pub mod requests;
 pub mod storage;
 pub mod types;
+pub mod unlock;
 
 pub use crypto::{
     decrypt_item, decrypt_private_key, derive_master_key, encrypt_item, unwrap_grant_key,
