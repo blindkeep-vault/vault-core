@@ -259,7 +259,8 @@ pub fn decrypt_owned_item(
     let item_key = unwrap_item_key(&enc_key, wrapped_key, nonce, &w_aad)?;
 
     let decrypted = crate::envelope::decrypt_blob_bytes(blob_data, &item_key, user_id)?;
-    let blob: SecretBlob = serde_json::from_slice(&decrypted)?;
+    let decrypted = crate::padding::unpad(&decrypted);
+    let blob: SecretBlob = serde_json::from_slice(decrypted)?;
     Ok(blob)
 }
 

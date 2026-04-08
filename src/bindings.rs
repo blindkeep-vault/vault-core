@@ -574,4 +574,168 @@ pub mod client_ops {
         crate::client::decrypt_group_name(&mk, user_id, wrapped_key, nonce, encrypted_blob_b64)
             .map_err(|e| e.to_string())
     }
+
+    /// Returns (envelope_b64, wrapped_key, nonce, encrypted_file).
+    #[allow(clippy::type_complexity)]
+    pub fn prepare_file_item_impl(
+        master_key: &[u8],
+        user_id: &str,
+        label: &str,
+        filename: &str,
+        mime_type: &str,
+        file_data: &[u8],
+    ) -> Result<(String, Vec<u8>, Vec<u8>, Vec<u8>), String> {
+        let mk = mk_from_bytes(master_key)?;
+        let p = crate::client::prepare_file_item(&mk, user_id, label, filename, mime_type, file_data)
+            .map_err(|e| e.to_string())?;
+        Ok((p.envelope_b64, p.wrapped_key, p.nonce.to_vec(), p.encrypted_file))
+    }
+
+    /// Returns (current_auth_key_hex, new_auth_key_hex, new_client_salt,
+    ///          new_encrypted_master_key, new_encrypted_private_key, new_master_key_bytes).
+    #[allow(clippy::type_complexity)]
+    pub fn prepare_password_change_impl(
+        current_password: &str,
+        new_password: &str,
+        current_client_salt: &[u8],
+        encrypted_private_key: &[u8],
+        master_key: &[u8],
+        user_id: &str,
+    ) -> Result<(String, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), String> {
+        let mk = mk_from_bytes(master_key)?;
+        let p = crate::client::prepare_password_change(
+            current_password,
+            new_password,
+            current_client_salt,
+            encrypted_private_key,
+            &mk,
+            user_id,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((
+            p.current_auth_key_hex,
+            p.new_auth_key_hex,
+            p.new_client_salt,
+            p.new_encrypted_master_key,
+            p.new_encrypted_private_key,
+            p.new_master_key.as_bytes().to_vec(),
+        ))
+    }
+
+    /// Returns (secret, key_prefix, auth_key_hex, wrapped_master_key).
+    pub fn prepare_api_key_full_impl(
+        master_key: &[u8],
+    ) -> Result<(Vec<u8>, String, String, Vec<u8>), String> {
+        let mk = mk_from_bytes(master_key)?;
+        let p = crate::client::prepare_api_key_full(&mk).map_err(|e| e.to_string())?;
+        Ok((p.secret.to_vec(), p.key_prefix, p.auth_key_hex, p.wrapped_master_key))
+    }
+
+    /// Returns (secret, key_prefix, auth_key_hex, encrypted_private_key, public_key).
+    #[allow(clippy::type_complexity)]
+    pub fn prepare_api_key_scoped_impl() -> Result<(Vec<u8>, String, String, Vec<u8>, Vec<u8>), String>
+    {
+        let p = crate::client::prepare_api_key_scoped().map_err(|e| e.to_string())?;
+        Ok((
+            p.secret.to_vec(),
+            p.key_prefix,
+            p.auth_key_hex,
+            p.encrypted_private_key,
+            p.public_key.to_vec(),
+        ))
+    }
+
+    /// Accepts items as JSON array of `[{"item_id":"...","item_key":[...]}]`.
+    /// Returns (wrapped_items_json, encrypted_will_key, ephemeral_pubkey).
+    pub fn prepare_will_payload_impl(
+        user_id: &str,
+        items_json: &str,
+        heir_pubkey: &[u8],
+    ) -> Result<(String, Vec<u8>, Vec<u8>), String> {
+        let hp = bytes_to_key32(heir_pubkey, "heir public key")?;
+
+        #[derive(serde::Deserialize)]
+        struct ItemEntry {
+            item_id: String,
+            item_key: Vec<u8>,
+        }
+        let entries: Vec<ItemEntry> =
+            serde_json::from_str(items_json).map_err(|e| e.to_string())?;
+        let items: Vec<crate::client::WillItemKey> = entries
+            .into_iter()
+            .map(|e| {
+                let mut key = [0u8; 32];
+                if e.item_key.len() != 32 {
+                    return Err("item_key must be 32 bytes".to_string());
+                }
+                key.copy_from_slice(&e.item_key);
+                Ok(crate::client::WillItemKey {
+                    item_id: e.item_id,
+                    item_key: key,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let p = crate::client::prepare_will_payload(user_id, &items, &hp)
+            .map_err(|e| e.to_string())?;
+        let wrapped_json =
+            serde_json::to_string(&serde_json::Value::Object(p.wrapped_items))
+                .map_err(|e| e.to_string())?;
+        Ok((wrapped_json, p.encrypted_will_key, p.ephemeral_pubkey.to_vec()))
+    }
+
+    /// Decrypt a user's private key from their master key + encrypted private key.
+    pub fn decrypt_private_key_from_master_impl(
+        master_key: &[u8],
+        encrypted_private_key: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let mk = mk_from_bytes(master_key)?;
+        let pk = crate::client::decrypt_private_key_from_master(&mk, encrypted_private_key)
+            .map_err(|e| e.to_string())?;
+        Ok(pk.to_vec())
+    }
+
+    /// Wrap a raw 32-byte key under the user's encryption subkey.
+    /// Returns (wrapped_key, nonce).
+    pub fn wrap_key_for_user_impl(
+        master_key: &[u8],
+        user_id: &str,
+        raw_key: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let mk = mk_from_bytes(master_key)?;
+        let k = bytes_to_key32(raw_key, "raw key")?;
+        let r = crate::client::wrap_key_for_user(&mk, user_id, &k)
+            .map_err(|e| e.to_string())?;
+        Ok((r.wrapped_key, r.nonce.to_vec()))
+    }
+
+    /// Unwrap an owned item key and re-wrap it for an API key's public key.
+    /// Returns (wrapped_key, ephemeral_pubkey, nonce).
+    #[allow(clippy::type_complexity)]
+    pub fn grant_item_to_api_key_impl(
+        master_key: &[u8],
+        user_id: &str,
+        item_wrapped_key: &[u8],
+        item_nonce: &[u8],
+        api_key_pubkey: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+        let mk = mk_from_bytes(master_key)?;
+        let pk = bytes_to_key32(api_key_pubkey, "API key public key")?;
+        let wk = crate::client::grant_item_to_api_key(&mk, user_id, item_wrapped_key, item_nonce, &pk)
+            .map_err(|e| e.to_string())?;
+        Ok((wk.wrapped_key.to_vec(), wk.ephemeral_pubkey.to_vec(), wk.nonce.to_vec()))
+    }
+
+    /// Decrypt a file item's metadata envelope (base64 blob).
+    pub fn decrypt_owned_inline_envelope_impl(
+        master_key: &[u8],
+        user_id: &str,
+        wrapped_key: &[u8],
+        nonce: &[u8],
+        encrypted_blob_b64: &str,
+    ) -> Result<crate::envelope::SecretBlob, String> {
+        let mk = mk_from_bytes(master_key)?;
+        crate::client::decrypt_owned_inline_envelope(&mk, user_id, wrapped_key, nonce, encrypted_blob_b64)
+            .map_err(|e| e.to_string())
+    }
 }
