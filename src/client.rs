@@ -433,7 +433,7 @@ pub fn prepare_registration(password: &str) -> Result<RegistrationPayload, Clien
     let enc_key = crypto::derive_subkey(&master_key, b"vault-enc")?;
 
     let (privkey, pubkey) = crypto::generate_x25519_keypair();
-    let enc_privkey = crypto::encrypt_item(&enc_key, &privkey)?;
+    let enc_privkey = crypto::encrypt_item_v1(&enc_key, &privkey, b"privkey")?;
 
     let mut encrypted_private_key = Vec::with_capacity(NONCE_LEN + enc_privkey.ciphertext.len());
     encrypted_private_key.extend_from_slice(&enc_privkey.nonce);
@@ -646,8 +646,8 @@ pub fn prepare_password_change(
     let new_auth_key = crypto::derive_subkey(&new_password_key, b"vault-auth")?;
     let new_enc_key = crypto::derive_subkey(&new_password_key, b"vault-enc")?;
 
-    // Re-encrypt private key (V0 — matches registration format)
-    let enc_privkey = crypto::encrypt_item(&new_enc_key, &*private_key)?;
+    // Re-encrypt private key (V1 with AAD)
+    let enc_privkey = crypto::encrypt_item_v1(&new_enc_key, &*private_key, b"privkey")?;
     let mut new_encrypted_private_key =
         Vec::with_capacity(NONCE_LEN + enc_privkey.ciphertext.len());
     new_encrypted_private_key.extend_from_slice(&enc_privkey.nonce);
@@ -686,6 +686,64 @@ pub fn decrypt_private_key_from_master(
         &enc_key,
         encrypted_private_key,
     )?)
+}
+
+/// Result of [`prepare_will_payload_mnemonic`].
+#[cfg(feature = "drops")]
+#[derive(Debug, Clone)]
+pub struct PreparedWillPayloadMnemonic {
+    /// Map of item_id → base64(nonce || ciphertext) for each included item.
+    pub wrapped_items: serde_json::Map<String, serde_json::Value>,
+    /// Will key wrapped with the mnemonic-derived wrapping key: nonce(24) || ciphertext.
+    pub encrypted_will_key: Vec<u8>,
+    /// Hex-encoded lookup key for server-side lookup by the heir.
+    pub lookup_key: String,
+    /// The generated BIP39 mnemonic (must be shared with the heir out-of-band).
+    pub mnemonic: String,
+}
+
+/// Prepare a will payload using a BIP39 mnemonic for an heir without an account.
+///
+/// Generates a random will key, wraps each item key with it, then wraps the
+/// will key with a key derived from a new BIP39 mnemonic. The heir recovers
+/// access by providing the mnemonic.
+#[cfg(feature = "drops")]
+pub fn prepare_will_payload_mnemonic(
+    user_id: &str,
+    items: &[WillItemKey],
+) -> Result<PreparedWillPayloadMnemonic, ClientError> {
+    let will_key = random_key();
+    let w_aad = will_aad(user_id);
+
+    let mut wrapped_items = serde_json::Map::new();
+    for item in items {
+        let enc = crypto::encrypt_item_v1(&will_key, &item.item_key, &w_aad)?;
+        let mut buf = Vec::with_capacity(NONCE_LEN + enc.ciphertext.len());
+        buf.extend_from_slice(&enc.nonce);
+        buf.extend_from_slice(&enc.ciphertext);
+        wrapped_items.insert(
+            item.item_id.clone(),
+            serde_json::Value::String(STANDARD.encode(&buf)),
+        );
+    }
+
+    // Generate mnemonic and derive keys
+    let mnemonic = crate::drops::generate_bip39_mnemonic();
+    let wrapping_key = crate::drops::derive_drop_wrapping_key(&mnemonic, 2);
+    let lookup_key = crate::drops::derive_drop_lookup_key(&mnemonic);
+
+    // Wrap will key with mnemonic-derived wrapping key (V1)
+    let enc = crypto::encrypt_item_v1(&wrapping_key, &will_key, b"will-wrap")?;
+    let mut encrypted_will_key = Vec::with_capacity(NONCE_LEN + enc.ciphertext.len());
+    encrypted_will_key.extend_from_slice(&enc.nonce);
+    encrypted_will_key.extend_from_slice(&enc.ciphertext);
+
+    Ok(PreparedWillPayloadMnemonic {
+        wrapped_items,
+        encrypted_will_key,
+        lookup_key,
+        mnemonic,
+    })
 }
 
 /// Result of wrapping a key for the user.
@@ -737,7 +795,145 @@ pub fn grant_item_to_api_key(
     api_key_pubkey: &[u8; 32],
 ) -> Result<crypto::WrappedKey, ClientError> {
     let item_key = unwrap_owned_item_key(master_key, user_id, item_wrapped_key, item_nonce)?;
-    Ok(crypto::wrap_key_for_recipient(&item_key, api_key_pubkey)?)
+    Ok(crypto::wrap_key_for_recipient_v1(
+        &item_key,
+        api_key_pubkey,
+    )?)
+}
+
+// ---------------------------------------------------------------------------
+// Link-secret grants
+// ---------------------------------------------------------------------------
+
+/// Result of [`prepare_link_grant`].
+#[derive(Debug, Clone)]
+pub struct PreparedLinkGrant {
+    /// Item key wrapped with the link_secret (V1 ciphertext, no AAD).
+    pub wrapped_key: Vec<u8>,
+    /// Nonce used for wrapping the item key.
+    pub nonce: [u8; NONCE_LEN],
+    /// The 32-byte link secret (caller must keep to build share URL).
+    pub link_secret: [u8; 32],
+    /// The 32-byte claim key (caller encodes into share URL).
+    pub claim_key: [u8; 32],
+    /// The link_secret encrypted with the claim_key (AES-256-GCM).
+    pub claim_ciphertext: Vec<u8>,
+    /// SHA-256 hash of the claim_key, hex-encoded (for server lookup).
+    pub claim_token_hash: String,
+    /// If the item has a file blob key, this wraps the file key with link_secret.
+    /// Format: nonce(24) || ciphertext.
+    pub file_wrapped_key: Option<Vec<u8>>,
+}
+
+/// Prepare a link-secret grant for an item.
+///
+/// This generates a random link_secret and claim_key, wraps the item key
+/// with the link_secret, and encrypts the link_secret with the claim_key.
+/// The caller builds a share URL containing the base64url-encoded claim_key.
+///
+/// If `file_key` is provided (for file items), it is also wrapped with the
+/// link_secret in nonce(24) || ciphertext format.
+pub fn prepare_link_grant(
+    item_key: &[u8; 32],
+    file_key: Option<&[u8; 32]>,
+) -> Result<PreparedLinkGrant, ClientError> {
+    use sha2::{Digest, Sha256};
+
+    let link_secret = random_key();
+    let claim_key = random_key();
+
+    // Wrap item_key with link_secret (V1, empty AAD)
+    let ls_wrapped = crypto::encrypt_item_v1(&link_secret, item_key, b"")?;
+
+    // Encrypt link_secret with claim_key (AES-256-GCM)
+    let claim_ciphertext = crypto::encrypt_claim_secret(&claim_key, &link_secret)?;
+
+    // Hash claim_key for server-side lookup
+    let claim_token_hash = hex::encode(Sha256::digest(claim_key));
+
+    // Optionally wrap file key
+    let file_wrapped_key = match file_key {
+        Some(fk) => {
+            let enc = crypto::encrypt_item_v1(&link_secret, fk, b"link-file")?;
+            let mut buf = Vec::with_capacity(NONCE_LEN + enc.ciphertext.len());
+            buf.extend_from_slice(&enc.nonce);
+            buf.extend_from_slice(&enc.ciphertext);
+            Some(buf)
+        }
+        None => None,
+    };
+
+    Ok(PreparedLinkGrant {
+        wrapped_key: ls_wrapped.ciphertext,
+        nonce: ls_wrapped.nonce,
+        link_secret,
+        claim_key,
+        claim_ciphertext,
+        claim_token_hash,
+        file_wrapped_key,
+    })
+}
+
+/// Decrypt an item from a link-secret grant.
+///
+/// Given the claim_key (from the share URL) and the grant's claim_ciphertext
+/// and wrapped_key, recovers the item key and decrypts the blob.
+pub fn decrypt_link_grant(
+    claim_key: &[u8; 32],
+    claim_ciphertext: &[u8],
+    wrapped_key: &[u8],
+    nonce: &[u8],
+    blob_data: &[u8],
+    grantor_id: &str,
+) -> Result<SecretBlob, ClientError> {
+    let link_secret = crypto::decrypt_claim_secret(claim_key, claim_ciphertext)?;
+    let item_key_plain = crypto::decrypt_item_auto(&link_secret, wrapped_key, nonce, b"")?;
+    if item_key_plain.len() != 32 {
+        return Err(ClientError::InvalidKeyLength);
+    }
+    let mut item_key = [0u8; 32];
+    item_key.copy_from_slice(&item_key_plain);
+
+    let decrypted = crate::envelope::decrypt_blob_bytes(blob_data, &item_key, grantor_id)?;
+    let unpadded = crate::padding::unpad(&decrypted);
+
+    match serde_json::from_slice::<SecretBlob>(unpadded) {
+        Ok(blob) => Ok(blob),
+        Err(_) => {
+            let text = String::from_utf8_lossy(unpadded).into_owned();
+            Ok(SecretBlob {
+                name: String::new(),
+                content: Some(text),
+                label: None,
+                item_type: None,
+                value: None,
+                filename: None,
+                mime_type: None,
+                file_size: None,
+                file_wrapped_key: None,
+                file_nonce: None,
+            })
+        }
+    }
+}
+
+/// Unwrap a link-secret grant's item key without decrypting the blob.
+///
+/// Returns the raw 32-byte item key recovered from the claim_key flow.
+pub fn unwrap_link_grant_key(
+    claim_key: &[u8; 32],
+    claim_ciphertext: &[u8],
+    wrapped_key: &[u8],
+    nonce: &[u8],
+) -> Result<[u8; 32], ClientError> {
+    let link_secret = crypto::decrypt_claim_secret(claim_key, claim_ciphertext)?;
+    let item_key_plain = crypto::decrypt_item_auto(&link_secret, wrapped_key, nonce, b"")?;
+    if item_key_plain.len() != 32 {
+        return Err(ClientError::InvalidKeyLength);
+    }
+    let mut item_key = [0u8; 32];
+    item_key.copy_from_slice(&item_key_plain);
+    Ok(item_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -995,14 +1191,131 @@ mod tests {
         )
         .unwrap();
 
-        // API key unwraps
-        let item_key = crypto::unwrap_key(
+        // API key unwraps (V1)
+        let item_key = crypto::unwrap_key_v1(
             &api_privkey,
             &grant.ephemeral_pubkey,
             &grant.wrapped_key,
             &grant.nonce,
+            &api_pubkey,
         )
         .unwrap();
         assert_eq!(item_key.len(), 32);
+    }
+
+    #[test]
+    fn link_grant_roundtrip() {
+        let mk = test_master_key();
+        let user_id = "link-grant-user";
+
+        // Create an item
+        let prepared =
+            prepare_item_create(&mk, user_id, "shared-link", "link-secret-val", None).unwrap();
+        let item_key =
+            unwrap_owned_item_key(&mk, user_id, &prepared.wrapped_key, &prepared.nonce).unwrap();
+
+        // Create link grant
+        let lg = prepare_link_grant(&item_key, None).unwrap();
+        assert!(!lg.claim_ciphertext.is_empty());
+        assert_eq!(lg.claim_token_hash.len(), 64); // hex-encoded SHA-256
+        assert!(lg.file_wrapped_key.is_none());
+
+        // Decrypt via link grant
+        let blob_data = STANDARD.decode(&prepared.encrypted_blob_b64).unwrap();
+        let blob = decrypt_link_grant(
+            &lg.claim_key,
+            &lg.claim_ciphertext,
+            &lg.wrapped_key,
+            &lg.nonce,
+            &blob_data,
+            user_id,
+        )
+        .unwrap();
+        assert_eq!(blob.secret_value(), Some("link-secret-val"));
+    }
+
+    #[test]
+    fn link_grant_with_file_key() {
+        let item_key = [1u8; 32];
+        let file_key = [2u8; 32];
+
+        let lg = prepare_link_grant(&item_key, Some(&file_key)).unwrap();
+        assert!(lg.file_wrapped_key.is_some());
+
+        // Unwrap item key
+        let recovered = unwrap_link_grant_key(
+            &lg.claim_key,
+            &lg.claim_ciphertext,
+            &lg.wrapped_key,
+            &lg.nonce,
+        )
+        .unwrap();
+        assert_eq!(recovered, item_key);
+
+        // Unwrap file key from link_secret (nonce(24) || V1 ciphertext)
+        let file_wrapped = lg.file_wrapped_key.unwrap();
+        let nonce = &file_wrapped[..NONCE_LEN];
+        let ct = &file_wrapped[NONCE_LEN..];
+        let file_recovered =
+            crypto::decrypt_item_auto(&lg.link_secret, ct, nonce, b"link-file").unwrap();
+        assert_eq!(&*file_recovered, &file_key);
+    }
+
+    #[test]
+    fn unwrap_link_grant_key_roundtrip() {
+        let item_key = [42u8; 32];
+        let lg = prepare_link_grant(&item_key, None).unwrap();
+        let recovered = unwrap_link_grant_key(
+            &lg.claim_key,
+            &lg.claim_ciphertext,
+            &lg.wrapped_key,
+            &lg.nonce,
+        )
+        .unwrap();
+        assert_eq!(recovered, item_key);
+    }
+
+    #[cfg(feature = "drops")]
+    #[test]
+    fn will_payload_mnemonic_roundtrip() {
+        let user_id = "will-owner-mnemonic";
+        let items = vec![
+            WillItemKey {
+                item_id: "item-a".into(),
+                item_key: [10u8; 32],
+            },
+            WillItemKey {
+                item_id: "item-b".into(),
+                item_key: [20u8; 32],
+            },
+        ];
+
+        let payload = prepare_will_payload_mnemonic(user_id, &items).unwrap();
+        assert_eq!(payload.wrapped_items.len(), 2);
+        assert_eq!(payload.mnemonic.split_whitespace().count(), 12);
+        assert_eq!(payload.lookup_key.len(), 64); // hex-encoded 32 bytes
+
+        // Heir recovers: derive wrapping key from mnemonic, unwrap will key
+        let wrapping_key = crate::drops::derive_drop_wrapping_key(&payload.mnemonic, 2);
+        let ewk = &payload.encrypted_will_key;
+        let nonce = &ewk[..NONCE_LEN];
+        let ct = &ewk[NONCE_LEN..];
+        let will_key_plain =
+            crypto::decrypt_item_auto(&wrapping_key, ct, nonce, b"will-wrap").unwrap();
+        let mut wk_arr = [0u8; 32];
+        wk_arr.copy_from_slice(&will_key_plain);
+        let will_key = wk_arr;
+
+        // Decrypt each item key
+        let w_aad = will_aad(user_id);
+        for item in &items {
+            let wrapped_b64 = payload.wrapped_items[&item.item_id].as_str().unwrap();
+            let wrapped_bytes = STANDARD.decode(wrapped_b64).unwrap();
+            let nonce = &wrapped_bytes[..NONCE_LEN];
+            let ciphertext = &wrapped_bytes[NONCE_LEN..];
+            let decrypted =
+                crypto::decrypt_item_auto(&will_key, ciphertext, nonce, &w_aad).unwrap();
+            assert_eq!(&*decrypted, &item.item_key);
+        }
     }
 }

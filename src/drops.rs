@@ -3,7 +3,7 @@ use hmac::Hmac;
 use sha2::{Sha256, Sha512};
 use zeroize::Zeroizing;
 
-use crate::crypto::{decrypt_item, encrypt_item, CryptoError};
+use crate::crypto::CryptoError;
 
 /// Normalize a mnemonic: lowercase, single-space separated.
 pub fn normalize_mnemonic(m: &str) -> String {
@@ -32,9 +32,9 @@ pub fn derive_drop_wrapping_key(mnemonic: &str, version: i32) -> Zeroizing<[u8; 
     out
 }
 
-/// Wrap a 32-byte drop key: encrypt with wrapping key, return nonce(24) || ciphertext.
+/// Wrap a 32-byte drop key: encrypt with wrapping key (V1 with AAD), return nonce(24) || ciphertext.
 pub fn wrap_drop_key(wrapping_key: &[u8; 32], drop_key: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
-    let enc = encrypt_item(wrapping_key, drop_key)?;
+    let enc = crate::crypto::encrypt_item_v1(wrapping_key, drop_key, b"drop-wrap")?;
     let mut out = Vec::with_capacity(24 + enc.ciphertext.len());
     out.extend_from_slice(&enc.nonce);
     out.extend_from_slice(&enc.ciphertext);
@@ -42,6 +42,7 @@ pub fn wrap_drop_key(wrapping_key: &[u8; 32], drop_key: &[u8; 32]) -> Result<Vec
 }
 
 /// Unwrap a drop key from nonce(24) || ciphertext format.
+/// Supports both V0 (legacy) and V1 formats.
 pub fn unwrap_drop_key(
     wrapping_key: &[u8; 32],
     wrapped: &[u8],
@@ -51,7 +52,7 @@ pub fn unwrap_drop_key(
     }
     let nonce = &wrapped[..24];
     let ciphertext = &wrapped[24..];
-    let plain = decrypt_item(wrapping_key, ciphertext, nonce)?;
+    let plain = crate::crypto::decrypt_item_auto(wrapping_key, ciphertext, nonce, b"drop-wrap")?;
     if plain.len() != 32 {
         return Err(CryptoError::InvalidKeyLength);
     }

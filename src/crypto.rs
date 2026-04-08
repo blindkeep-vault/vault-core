@@ -104,6 +104,10 @@ pub fn derive_subkey(
 }
 
 /// Encrypt plaintext with a 256-bit key using XChaCha20-Poly1305.
+///
+/// **Deprecated:** Use [`encrypt_item_v1`] with AAD for all new encryption.
+/// This function is retained only for backwards compatibility tests.
+#[deprecated(note = "Use encrypt_item_v1 with AAD for all new encryption")]
 pub fn encrypt_item(
     key: &[u8; KEY_LEN],
     plaintext: &[u8],
@@ -159,6 +163,11 @@ pub fn decrypt_item(
 }
 
 /// Wrap an item key for a recipient using X25519 key exchange + XChaCha20-Poly1305.
+///
+/// **Deprecated:** Use [`wrap_key_for_recipient_v1`] for all new key wrapping.
+/// This function is retained for reading legacy V0-wrapped keys.
+#[deprecated(note = "Use wrap_key_for_recipient_v1 for all new key wrapping")]
+#[allow(deprecated)]
 pub fn wrap_key_for_recipient(
     item_key: &[u8; KEY_LEN],
     recipient_public_key: &[u8; PUBKEY_LEN],
@@ -444,7 +453,8 @@ pub fn unwrap_grant_key(
 }
 
 /// Decrypt a user's private key from the stored format (nonce(24) || ciphertext).
-/// The `enc_key` is typically derived via `derive_subkey(master_key, b"encrypt")`.
+/// Supports both V0 (legacy) and V1 (with AAD) formats.
+/// The `enc_key` is typically derived via `derive_subkey(master_key, b"vault-enc")`.
 pub fn decrypt_private_key(
     enc_key: &[u8; KEY_LEN],
     encrypted_private_key: &[u8],
@@ -454,7 +464,7 @@ pub fn decrypt_private_key(
     }
     let nonce = &encrypted_private_key[..NONCE_LEN];
     let ciphertext = &encrypted_private_key[NONCE_LEN..];
-    let plaintext = decrypt_item(enc_key, ciphertext, nonce)?;
+    let plaintext = decrypt_item_auto(enc_key, ciphertext, nonce, b"privkey")?;
     if plaintext.len() != KEY_LEN {
         return Err(CryptoError::InvalidKeyLength);
     }
@@ -495,12 +505,12 @@ pub fn derive_api_key_keys(
 }
 
 /// Wrap a master key with a symmetric wrapping key (for API key storage).
-/// Returns nonce(24) || ciphertext concatenated.
+/// Returns nonce(24) || ciphertext concatenated (V1 format with AAD).
 pub fn wrap_master_key(
     wrapping_key: &[u8; KEY_LEN],
     master_key: &MasterKey,
 ) -> Result<Vec<u8>, CryptoError> {
-    let enc = encrypt_item(wrapping_key, master_key.as_bytes())?;
+    let enc = encrypt_item_v1(wrapping_key, master_key.as_bytes(), b"apikey-wrap")?;
     let mut out = Vec::with_capacity(NONCE_LEN + enc.ciphertext.len());
     out.extend_from_slice(&enc.nonce);
     out.extend_from_slice(&enc.ciphertext);
@@ -508,7 +518,7 @@ pub fn wrap_master_key(
 }
 
 /// Unwrap a master key from API key wrapped form.
-/// Input is nonce(24) || ciphertext.
+/// Input is nonce(24) || ciphertext. Supports both V0 and V1 formats.
 pub fn unwrap_master_key(
     wrapping_key: &[u8; KEY_LEN],
     wrapped: &[u8],
@@ -518,7 +528,7 @@ pub fn unwrap_master_key(
     }
     let nonce = &wrapped[..NONCE_LEN];
     let ciphertext = &wrapped[NONCE_LEN..];
-    let plaintext = decrypt_item(wrapping_key, ciphertext, nonce)?;
+    let plaintext = decrypt_item_auto(wrapping_key, ciphertext, nonce, b"apikey-wrap")?;
     if plaintext.len() != KEY_LEN {
         return Err(CryptoError::InvalidKeyLength);
     }

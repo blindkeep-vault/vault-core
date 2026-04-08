@@ -99,7 +99,8 @@ pub fn generate_random_key_impl() -> Vec<u8> {
 // Symmetric encryption
 // ---------------------------------------------------------------------------
 
-/// Encrypt plaintext. Returns (ciphertext, nonce).
+/// Encrypt plaintext (V0, no AAD). Kept for backwards compatibility.
+#[allow(deprecated)]
 pub fn encrypt_impl(key: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     let key_arr = bytes_to_key32(key, "key")?;
     let payload = crypto::encrypt_item(&key_arr, plaintext).map_err(|e| e.to_string())?;
@@ -140,8 +141,8 @@ pub fn decrypt_auto_impl(
 // Asymmetric key wrapping (V0)
 // ---------------------------------------------------------------------------
 
-/// Wrap key for recipient (V0). Returns (wrapped_key, ephemeral_pubkey, nonce).
-#[allow(clippy::type_complexity)]
+/// Wrap key for recipient (V0). Kept for backwards compatibility.
+#[allow(clippy::type_complexity, deprecated)]
 pub fn wrap_key_for_recipient_impl(
     item_key: &[u8],
     recipient_pubkey: &[u8],
@@ -586,9 +587,15 @@ pub mod client_ops {
         file_data: &[u8],
     ) -> Result<(String, Vec<u8>, Vec<u8>, Vec<u8>), String> {
         let mk = mk_from_bytes(master_key)?;
-        let p = crate::client::prepare_file_item(&mk, user_id, label, filename, mime_type, file_data)
-            .map_err(|e| e.to_string())?;
-        Ok((p.envelope_b64, p.wrapped_key, p.nonce.to_vec(), p.encrypted_file))
+        let p =
+            crate::client::prepare_file_item(&mk, user_id, label, filename, mime_type, file_data)
+                .map_err(|e| e.to_string())?;
+        Ok((
+            p.envelope_b64,
+            p.wrapped_key,
+            p.nonce.to_vec(),
+            p.encrypted_file,
+        ))
     }
 
     /// Returns (current_auth_key_hex, new_auth_key_hex, new_client_salt,
@@ -628,13 +635,18 @@ pub mod client_ops {
     ) -> Result<(Vec<u8>, String, String, Vec<u8>), String> {
         let mk = mk_from_bytes(master_key)?;
         let p = crate::client::prepare_api_key_full(&mk).map_err(|e| e.to_string())?;
-        Ok((p.secret.to_vec(), p.key_prefix, p.auth_key_hex, p.wrapped_master_key))
+        Ok((
+            p.secret.to_vec(),
+            p.key_prefix,
+            p.auth_key_hex,
+            p.wrapped_master_key,
+        ))
     }
 
     /// Returns (secret, key_prefix, auth_key_hex, encrypted_private_key, public_key).
     #[allow(clippy::type_complexity)]
-    pub fn prepare_api_key_scoped_impl() -> Result<(Vec<u8>, String, String, Vec<u8>, Vec<u8>), String>
-    {
+    pub fn prepare_api_key_scoped_impl(
+    ) -> Result<(Vec<u8>, String, String, Vec<u8>, Vec<u8>), String> {
         let p = crate::client::prepare_api_key_scoped().map_err(|e| e.to_string())?;
         Ok((
             p.secret.to_vec(),
@@ -676,12 +688,15 @@ pub mod client_ops {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let p = crate::client::prepare_will_payload(user_id, &items, &hp)
+        let p =
+            crate::client::prepare_will_payload(user_id, &items, &hp).map_err(|e| e.to_string())?;
+        let wrapped_json = serde_json::to_string(&serde_json::Value::Object(p.wrapped_items))
             .map_err(|e| e.to_string())?;
-        let wrapped_json =
-            serde_json::to_string(&serde_json::Value::Object(p.wrapped_items))
-                .map_err(|e| e.to_string())?;
-        Ok((wrapped_json, p.encrypted_will_key, p.ephemeral_pubkey.to_vec()))
+        Ok((
+            wrapped_json,
+            p.encrypted_will_key,
+            p.ephemeral_pubkey.to_vec(),
+        ))
     }
 
     /// Decrypt a user's private key from their master key + encrypted private key.
@@ -704,8 +719,7 @@ pub mod client_ops {
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let mk = mk_from_bytes(master_key)?;
         let k = bytes_to_key32(raw_key, "raw key")?;
-        let r = crate::client::wrap_key_for_user(&mk, user_id, &k)
-            .map_err(|e| e.to_string())?;
+        let r = crate::client::wrap_key_for_user(&mk, user_id, &k).map_err(|e| e.to_string())?;
         Ok((r.wrapped_key, r.nonce.to_vec()))
     }
 
@@ -721,9 +735,14 @@ pub mod client_ops {
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
         let mk = mk_from_bytes(master_key)?;
         let pk = bytes_to_key32(api_key_pubkey, "API key public key")?;
-        let wk = crate::client::grant_item_to_api_key(&mk, user_id, item_wrapped_key, item_nonce, &pk)
-            .map_err(|e| e.to_string())?;
-        Ok((wk.wrapped_key.to_vec(), wk.ephemeral_pubkey.to_vec(), wk.nonce.to_vec()))
+        let wk =
+            crate::client::grant_item_to_api_key(&mk, user_id, item_wrapped_key, item_nonce, &pk)
+                .map_err(|e| e.to_string())?;
+        Ok((
+            wk.wrapped_key.to_vec(),
+            wk.ephemeral_pubkey.to_vec(),
+            wk.nonce.to_vec(),
+        ))
     }
 
     /// Decrypt a file item's metadata envelope (base64 blob).
@@ -735,7 +754,154 @@ pub mod client_ops {
         encrypted_blob_b64: &str,
     ) -> Result<crate::envelope::SecretBlob, String> {
         let mk = mk_from_bytes(master_key)?;
-        crate::client::decrypt_owned_inline_envelope(&mk, user_id, wrapped_key, nonce, encrypted_blob_b64)
+        crate::client::decrypt_owned_inline_envelope(
+            &mk,
+            user_id,
+            wrapped_key,
+            nonce,
+            encrypted_blob_b64,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Link-secret grants
+    // -----------------------------------------------------------------------
+
+    /// Prepare a link-secret grant for an item.
+    /// Returns (wrapped_key, nonce, link_secret, claim_key, claim_ciphertext,
+    ///          claim_token_hash, file_wrapped_key_or_empty).
+    #[allow(clippy::type_complexity)]
+    pub fn prepare_link_grant_impl(
+        item_key: &[u8],
+        file_key: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String, Vec<u8>), String> {
+        let ik = bytes_to_key32(item_key, "item key")?;
+        let fk = match file_key {
+            Some(b) if !b.is_empty() => Some(bytes_to_key32(b, "file key")?),
+            _ => None,
+        };
+        let lg = crate::client::prepare_link_grant(&ik, fk.as_ref()).map_err(|e| e.to_string())?;
+        Ok((
+            lg.wrapped_key,
+            lg.nonce.to_vec(),
+            lg.link_secret.to_vec(),
+            lg.claim_key.to_vec(),
+            lg.claim_ciphertext,
+            lg.claim_token_hash,
+            lg.file_wrapped_key.unwrap_or_default(),
+        ))
+    }
+
+    /// Decrypt an item from a link-secret grant.
+    pub fn decrypt_link_grant_impl(
+        claim_key: &[u8],
+        claim_ciphertext: &[u8],
+        wrapped_key: &[u8],
+        nonce: &[u8],
+        blob_data: &[u8],
+        grantor_id: &str,
+    ) -> Result<crate::envelope::SecretBlob, String> {
+        let ck = bytes_to_key32(claim_key, "claim key")?;
+        crate::client::decrypt_link_grant(
+            &ck,
+            claim_ciphertext,
+            wrapped_key,
+            nonce,
+            blob_data,
+            grantor_id,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Unwrap a link-secret grant's item key without decrypting the blob.
+    pub fn unwrap_link_grant_key_impl(
+        claim_key: &[u8],
+        claim_ciphertext: &[u8],
+        wrapped_key: &[u8],
+        nonce: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let ck = bytes_to_key32(claim_key, "claim key")?;
+        crate::client::unwrap_link_grant_key(&ck, claim_ciphertext, wrapped_key, nonce)
+            .map(|k| k.to_vec())
             .map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Will payload (mnemonic fallback)
+    // -----------------------------------------------------------------------
+
+    /// Prepare a will payload using a BIP39 mnemonic for an heir without an account.
+    /// items_json: `[{"item_id":"...","item_key":[...]}]`
+    /// Returns (wrapped_items_json, encrypted_will_key, lookup_key, mnemonic).
+    #[cfg(feature = "drops")]
+    pub fn prepare_will_payload_mnemonic_impl(
+        user_id: &str,
+        items_json: &str,
+    ) -> Result<(String, Vec<u8>, String, String), String> {
+        #[derive(serde::Deserialize)]
+        struct ItemEntry {
+            item_id: String,
+            item_key: Vec<u8>,
+        }
+        let entries: Vec<ItemEntry> =
+            serde_json::from_str(items_json).map_err(|e| e.to_string())?;
+        let items: Vec<crate::client::WillItemKey> = entries
+            .into_iter()
+            .map(|e| {
+                let mut key = [0u8; 32];
+                if e.item_key.len() != 32 {
+                    return Err("item_key must be 32 bytes".to_string());
+                }
+                key.copy_from_slice(&e.item_key);
+                Ok(crate::client::WillItemKey {
+                    item_id: e.item_id,
+                    item_key: key,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let p = crate::client::prepare_will_payload_mnemonic(user_id, &items)
+            .map_err(|e| e.to_string())?;
+        let wrapped_json = serde_json::to_string(&serde_json::Value::Object(p.wrapped_items))
+            .map_err(|e| e.to_string())?;
+        Ok((wrapped_json, p.encrypted_will_key, p.lookup_key, p.mnemonic))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "drops")]
+pub mod parsing_ops {
+    /// Parse drop input. Returns a JSON string describing the result.
+    ///
+    /// On success, returns either:
+    /// - `{"type":"direct","drop_id":"...","key":[...]}`
+    /// - `{"type":"mnemonic","mnemonic":"...","drop_id":null|"..."}`
+    pub fn parse_drop_input_impl(key: &str, key2: Option<&str>) -> Result<String, String> {
+        let result = crate::parsing::parse_drop_input(key, key2).map_err(|e| e.to_string())?;
+        match result {
+            crate::parsing::DropInput::Direct { drop_id, key } => Ok(serde_json::json!({
+                "type": "direct",
+                "drop_id": drop_id,
+                "key": key.to_vec(),
+            })
+            .to_string()),
+            crate::parsing::DropInput::Mnemonic { mnemonic, drop_id } => Ok(serde_json::json!({
+                "type": "mnemonic",
+                "mnemonic": mnemonic,
+                "drop_id": drop_id,
+            })
+            .to_string()),
+        }
+    }
+
+    /// Parse a grant-accept URL. Returns (grant_id, claim_key_b64) or error.
+    pub fn parse_grant_url_impl(url: &str) -> Result<(String, String), String> {
+        crate::parsing::parse_grant_url(url)
+            .map(|gl| (gl.grant_id, gl.claim_key_b64))
+            .ok_or_else(|| "could not parse grant URL".to_string())
     }
 }
