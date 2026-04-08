@@ -806,16 +806,16 @@ pub fn grant_item_to_api_key(
 // ---------------------------------------------------------------------------
 
 /// Result of [`prepare_link_grant`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedLinkGrant {
-    /// Item key wrapped with the link_secret (V1 ciphertext, no AAD).
+    /// Item key wrapped with the link_secret (V1 ciphertext, empty AAD).
     pub wrapped_key: Vec<u8>,
     /// Nonce used for wrapping the item key.
     pub nonce: [u8; NONCE_LEN],
     /// The 32-byte link secret (caller must keep to build share URL).
-    pub link_secret: [u8; 32],
+    pub link_secret: Zeroizing<[u8; 32]>,
     /// The 32-byte claim key (caller encodes into share URL).
-    pub claim_key: [u8; 32],
+    pub claim_key: Zeroizing<[u8; 32]>,
     /// The link_secret encrypted with the claim_key (AES-256-GCM).
     pub claim_ciphertext: Vec<u8>,
     /// SHA-256 hash of the claim_key, hex-encoded (for server lookup).
@@ -839,17 +839,17 @@ pub fn prepare_link_grant(
 ) -> Result<PreparedLinkGrant, ClientError> {
     use sha2::{Digest, Sha256};
 
-    let link_secret = random_key();
-    let claim_key = random_key();
+    let link_secret = Zeroizing::new(random_key());
+    let claim_key = Zeroizing::new(random_key());
 
-    // Wrap item_key with link_secret (V1, empty AAD)
+    // Wrap item_key with link_secret (V1, empty AAD for cross-platform compat)
     let ls_wrapped = crypto::encrypt_item_v1(&link_secret, item_key, b"")?;
 
     // Encrypt link_secret with claim_key (AES-256-GCM)
     let claim_ciphertext = crypto::encrypt_claim_secret(&claim_key, &link_secret)?;
 
     // Hash claim_key for server-side lookup
-    let claim_token_hash = hex::encode(Sha256::digest(claim_key));
+    let claim_token_hash = hex::encode(Sha256::digest(&*claim_key));
 
     // Optionally wrap file key
     let file_wrapped_key = match file_key {
@@ -1223,7 +1223,7 @@ mod tests {
         // Decrypt via link grant
         let blob_data = STANDARD.decode(&prepared.encrypted_blob_b64).unwrap();
         let blob = decrypt_link_grant(
-            &lg.claim_key,
+            &*lg.claim_key,
             &lg.claim_ciphertext,
             &lg.wrapped_key,
             &lg.nonce,
@@ -1244,7 +1244,7 @@ mod tests {
 
         // Unwrap item key
         let recovered = unwrap_link_grant_key(
-            &lg.claim_key,
+            &*lg.claim_key,
             &lg.claim_ciphertext,
             &lg.wrapped_key,
             &lg.nonce,
@@ -1257,7 +1257,7 @@ mod tests {
         let nonce = &file_wrapped[..NONCE_LEN];
         let ct = &file_wrapped[NONCE_LEN..];
         let file_recovered =
-            crypto::decrypt_item_auto(&lg.link_secret, ct, nonce, b"link-file").unwrap();
+            crypto::decrypt_item_auto(&*lg.link_secret, ct, nonce, b"link-file").unwrap();
         assert_eq!(&*file_recovered, &file_key);
     }
 
@@ -1266,7 +1266,7 @@ mod tests {
         let item_key = [42u8; 32];
         let lg = prepare_link_grant(&item_key, None).unwrap();
         let recovered = unwrap_link_grant_key(
-            &lg.claim_key,
+            &*lg.claim_key,
             &lg.claim_ciphertext,
             &lg.wrapped_key,
             &lg.nonce,
