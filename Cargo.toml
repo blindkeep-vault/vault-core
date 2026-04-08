@@ -27,5 +27,6 @@ jsonwebtoken = { version = "10", features = ["aws_lc_rs"], optional = true }
 
 [features]
 default = ["drops", "server"]
+client = ["dep:hex"]
 drops = ["dep:bip39", "dep:hex", "dep:hmac", "dep:pbkdf2"]
 server = ["dep:jsonwebtoken"]

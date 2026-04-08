@@ -1,5 +1,7 @@
 #[cfg(feature = "server")]
 pub mod auth;
+#[cfg(feature = "client")]
+pub mod client;
 pub mod crypto;
 #[cfg(feature = "drops")]
 pub mod drops;

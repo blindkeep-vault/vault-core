@@ -26,6 +26,12 @@ pub enum CryptoError {
 #[zeroize(drop)]
 pub struct MasterKey([u8; 32]);
 
+impl std::fmt::Debug for MasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MasterKey([REDACTED])")
+    }
+}
+
 impl MasterKey {
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         MasterKey(bytes)
