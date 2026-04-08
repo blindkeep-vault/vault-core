@@ -108,6 +108,24 @@ pub fn decrypt_inline_envelope(
     }
 }
 
+/// Build a binary envelope: `[4-byte BE header_len][JSON metadata][file_data]`.
+///
+/// This is the inverse of [`parse_envelope`].
+pub fn build_envelope(filename: &str, data: &[u8], mime_type: &str) -> Vec<u8> {
+    let meta = serde_json::json!({
+        "name": filename,
+        "type": mime_type,
+        "size": data.len(),
+    });
+    let meta_bytes = serde_json::to_vec(&meta).expect("JSON serialization cannot fail");
+    let header_len = meta_bytes.len() as u32;
+    let mut out = Vec::with_capacity(4 + meta_bytes.len() + data.len());
+    out.extend_from_slice(&header_len.to_be_bytes());
+    out.extend_from_slice(&meta_bytes);
+    out.extend_from_slice(data);
+    out
+}
+
 /// Parse a binary envelope: 4-byte BE header length + JSON metadata + file bytes.
 /// Returns `(filename, file_data)`. Falls back to a default name if parsing fails.
 pub fn parse_envelope<'a>(data: &'a [u8], fallback_id: &str) -> (String, &'a [u8]) {
@@ -293,5 +311,26 @@ mod tests {
     fn decrypt_blob_bytes_too_short() {
         let result = decrypt_blob_bytes(&[0u8; 10], &[0u8; 32], "user1");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_parse_envelope_roundtrip() {
+        let filename = "report.pdf";
+        let file_data = b"binary file contents here";
+        let mime = "application/pdf";
+
+        let envelope = build_envelope(filename, file_data, mime);
+        let (parsed_name, parsed_data) = parse_envelope(&envelope, "fallback");
+
+        assert_eq!(parsed_name, filename);
+        assert_eq!(parsed_data, file_data);
+    }
+
+    #[test]
+    fn build_envelope_empty_data() {
+        let envelope = build_envelope("empty.txt", b"", "text/plain");
+        let (name, data) = parse_envelope(&envelope, "fb");
+        assert_eq!(name, "empty.txt");
+        assert!(data.is_empty());
     }
 }
