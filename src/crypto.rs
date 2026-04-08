@@ -555,6 +555,59 @@ pub fn verify_notarization_signature(
     vk.verify_strict(&msg, &sig).is_ok()
 }
 
+// ---------------------------------------------------------------------------
+// AES-256-GCM claim token encryption (link-secret grants)
+// ---------------------------------------------------------------------------
+
+/// Encrypt a 32-byte link secret with a claim key using AES-256-GCM.
+///
+/// Returns `iv(12) || ciphertext(32 + 16-byte tag)`.
+/// Compatible with Web UI's SubtleCrypto AES-GCM.
+pub fn encrypt_claim_secret(
+    claim_key: &[u8; 32],
+    link_secret: &[u8; 32],
+) -> Result<Vec<u8>, CryptoError> {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+    use rand::RngCore;
+
+    let cipher = Aes256Gcm::new(claim_key.into());
+    let mut iv = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut iv);
+    let nonce = Nonce::from_slice(&iv);
+    let ciphertext = cipher
+        .encrypt(nonce, link_secret.as_ref())
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&iv);
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+/// Decrypt a 32-byte link secret from `iv(12) || ciphertext` using AES-256-GCM.
+pub fn decrypt_claim_secret(
+    claim_key: &[u8; 32],
+    claim_ciphertext: &[u8],
+) -> Result<[u8; 32], CryptoError> {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+
+    if claim_ciphertext.len() < 12 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let iv = &claim_ciphertext[..12];
+    let ct = &claim_ciphertext[12..];
+    let cipher = Aes256Gcm::new(claim_key.into());
+    let nonce = Nonce::from_slice(iv);
+    let plaintext = cipher
+        .decrypt(nonce, ct)
+        .map_err(|_| CryptoError::DecryptionFailed)?;
+    if plaintext.len() != 32 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&plaintext);
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,5 +1064,30 @@ mod tests {
 
         let wrong_key = [99u8; 32];
         assert!(decrypt_private_key(&wrong_key, &stored).is_err());
+    }
+
+    #[test]
+    fn claim_secret_roundtrip() {
+        let claim_key = [42u8; 32];
+        let link_secret = [77u8; 32];
+        let encrypted = encrypt_claim_secret(&claim_key, &link_secret).unwrap();
+        assert_eq!(encrypted.len(), 12 + 32 + 16); // iv + plaintext + tag
+        let decrypted = decrypt_claim_secret(&claim_key, &encrypted).unwrap();
+        assert_eq!(decrypted, link_secret);
+    }
+
+    #[test]
+    fn claim_secret_wrong_key_fails() {
+        let claim_key = [42u8; 32];
+        let link_secret = [77u8; 32];
+        let encrypted = encrypt_claim_secret(&claim_key, &link_secret).unwrap();
+        let wrong_key = [99u8; 32];
+        assert!(decrypt_claim_secret(&wrong_key, &encrypted).is_err());
+    }
+
+    #[test]
+    fn claim_secret_truncated_fails() {
+        let claim_key = [42u8; 32];
+        assert!(decrypt_claim_secret(&claim_key, &[0u8; 5]).is_err());
     }
 }

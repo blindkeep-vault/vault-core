@@ -17,6 +17,7 @@ pub mod requests;
 pub mod storage;
 pub mod types;
 pub mod unlock;
+pub mod util;
 
 pub use crypto::{
     decrypt_item, decrypt_private_key, derive_master_key, encrypt_item, unwrap_grant_key,
