@@ -9,6 +9,21 @@ fn jwt_validation() -> Validation {
     Validation::new(jsonwebtoken::Algorithm::HS256)
 }
 
+/// Which tier of access this session represents.
+///
+/// - `Full` — client has (or can derive) the vault master key: password login,
+///   passkey+PRF login, API key auth, legacy tokens.
+/// - `Limited` — authenticated via magic link only; the server has no evidence
+///   the client holds the vault key. The server's auth middleware enforces a
+///   path allow-list for this tier; vault-content routes return 403.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    #[default]
+    Full,
+    Limited,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: Uuid,
@@ -23,6 +38,8 @@ pub struct Claims {
     pub api_key_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    #[serde(default)]
+    pub session_kind: SessionKind,
 }
 
 pub fn encode_jwt(
@@ -57,6 +74,45 @@ pub fn encode_jwt_full(
         iat,
         api_key_id: None,
         read_only: None,
+        session_kind: SessionKind::Full,
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+}
+
+/// Issue a Limited session JWT (magic-link login: authenticated but vault locked).
+///
+/// The auth middleware's path allow-list blocks this tier from routes that
+/// need the vault master key on the client. The client can swap this for a
+/// `Full` JWT via the `/auth/upgrade-session` endpoint by supplying the
+/// password-derived `auth_key`.
+pub fn encode_jwt_limited(
+    user_id: Uuid,
+    email: &str,
+    needs_password_setup: bool,
+    secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let now = chrono::Utc::now();
+    let exp = now
+        .checked_add_signed(chrono::Duration::hours(24))
+        .expect("valid timestamp")
+        .timestamp() as usize;
+    let iat = now.timestamp() as usize;
+
+    let claims = Claims {
+        sub: user_id,
+        email: email.to_owned(),
+        email_verified: true,
+        needs_password_setup,
+        exp,
+        iat,
+        api_key_id: None,
+        read_only: None,
+        session_kind: SessionKind::Limited,
     };
 
     encode(
@@ -89,6 +145,7 @@ pub fn encode_jwt_api_key(
         iat,
         api_key_id: Some(api_key_id),
         read_only: Some(read_only),
+        session_kind: SessionKind::Full,
     };
 
     encode(
@@ -209,6 +266,7 @@ mod tests {
             iat: 0,
             api_key_id: None,
             read_only: None,
+            session_kind: SessionKind::Full,
         };
         let token = encode(
             &Header::default(),
@@ -220,6 +278,82 @@ mod tests {
         let result = decode_jwt_allow_expired(&token, TEST_SECRET);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().sub, test_user_id());
+    }
+
+    #[test]
+    fn default_session_kind_is_full() {
+        // Tokens issued before the session_kind claim existed must keep working.
+        // Construct a minimal JSON payload without the field and confirm it
+        // deserializes as Full.
+        use serde_json::json;
+        let payload = json!({
+            "sub": test_user_id().to_string(),
+            "email": "user@example.com",
+            "email_verified": true,
+            "exp": (chrono::Utc::now().timestamp() as usize) + 3600,
+        });
+        let claims: Claims = serde_json::from_value(payload).unwrap();
+        assert_eq!(claims.session_kind, SessionKind::Full);
+    }
+
+    #[test]
+    fn encode_jwt_limited_roundtrip() {
+        let uid = test_user_id();
+        let token = encode_jwt_limited(uid, "user@example.com", false, TEST_SECRET).unwrap();
+        let claims = decode_jwt_allow_expired(&token, TEST_SECRET).unwrap();
+
+        assert_eq!(claims.sub, uid);
+        assert_eq!(claims.session_kind, SessionKind::Limited);
+        assert!(claims.email_verified);
+        assert!(!claims.needs_password_setup);
+    }
+
+    #[test]
+    fn encode_jwt_limited_carries_needs_password_setup() {
+        let token =
+            encode_jwt_limited(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
+        let claims = decode_jwt_allow_expired(&token, TEST_SECRET).unwrap();
+        assert_eq!(claims.session_kind, SessionKind::Limited);
+        assert!(claims.needs_password_setup);
+    }
+
+    #[test]
+    fn regular_jwt_is_full_session() {
+        let token = encode_jwt(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
+        let claims = decode_jwt_allow_expired(&token, TEST_SECRET).unwrap();
+        assert_eq!(claims.session_kind, SessionKind::Full);
+    }
+
+    #[test]
+    fn session_kind_wire_format_is_snake_case() {
+        // Guard against a rename that breaks on-the-wire compatibility.
+        // The client parses this value directly from the JWT payload.
+        let token =
+            encode_jwt_limited(test_user_id(), "user@example.com", false, TEST_SECRET).unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let pad = (4 - payload_b64.len() % 4) % 4;
+        let mut padded = payload_b64.to_string();
+        padded.extend(std::iter::repeat('=').take(pad));
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE,
+            padded.as_bytes(),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["session_kind"], "limited");
+
+        let token2 = encode_jwt(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
+        let payload_b64 = token2.split('.').nth(1).unwrap();
+        let pad = (4 - payload_b64.len() % 4) % 4;
+        let mut padded = payload_b64.to_string();
+        padded.extend(std::iter::repeat('=').take(pad));
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE,
+            padded.as_bytes(),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["session_kind"], "full");
     }
 
     #[test]

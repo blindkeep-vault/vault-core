@@ -207,9 +207,7 @@ pub fn looks_like_uuid(s: &str) -> bool {
 pub fn try_decode_base64url_key(s: &str) -> Option<[u8; 32]> {
     let bytes = URL_SAFE_NO_PAD.decode(s).ok()?;
     if bytes.len() == 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Some(arr)
+        Some(bytes.try_into().unwrap())
     } else {
         None
     }
