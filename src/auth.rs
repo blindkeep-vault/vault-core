@@ -187,19 +187,6 @@ pub fn check_write_allowed(claims: &Claims) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Reject Limited (magic-link-only) sessions.
-///
-/// Call from routes that operate on vault content (items, grants, groups,
-/// notarizations, etc.) — anything whose purpose depends on the client
-/// holding the master key. Magic-link-limited clients do not have the master
-/// key and must call `/auth/upgrade-session` first.
-pub fn require_full_session(claims: &Claims) -> Result<(), ApiError> {
-    match claims.session_kind {
-        SessionKind::Full => Ok(()),
-        SessionKind::Limited => Err(ApiError::Forbidden),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,18 +325,35 @@ mod tests {
     }
 
     #[test]
-    fn require_full_session_permits_full() {
-        let token = encode_jwt(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
-        let claims = decode_jwt_allow_expired(&token, TEST_SECRET).unwrap();
-        assert!(require_full_session(&claims).is_ok());
-    }
-
-    #[test]
-    fn require_full_session_blocks_limited() {
+    fn session_kind_wire_format_is_snake_case() {
+        // Guard against a rename that breaks on-the-wire compatibility.
+        // The client parses this value directly from the JWT payload.
         let token =
             encode_jwt_limited(test_user_id(), "user@example.com", false, TEST_SECRET).unwrap();
-        let claims = decode_jwt_allow_expired(&token, TEST_SECRET).unwrap();
-        assert!(require_full_session(&claims).is_err());
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let pad = (4 - payload_b64.len() % 4) % 4;
+        let mut padded = payload_b64.to_string();
+        padded.extend(std::iter::repeat('=').take(pad));
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE,
+            padded.as_bytes(),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["session_kind"], "limited");
+
+        let token2 = encode_jwt(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
+        let payload_b64 = token2.split('.').nth(1).unwrap();
+        let pad = (4 - payload_b64.len() % 4) % 4;
+        let mut padded = payload_b64.to_string();
+        padded.extend(std::iter::repeat('=').take(pad));
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE,
+            padded.as_bytes(),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["session_kind"], "full");
     }
 
     #[test]
