@@ -17,10 +17,33 @@ pub struct Policy {
     pub notify_on_access: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_allowlist: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub one_shot: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub notarize_on_use: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn default_allowed_ops() -> Vec<String> {
     vec!["view".to_string(), "download".to_string()]
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            expires_at: None,
+            ttl_seconds: None,
+            max_views: None,
+            allowed_ops: default_allowed_ops(),
+            notify_on_access: false,
+            ip_allowlist: None,
+            one_shot: false,
+            notarize_on_use: false,
+        }
+    }
 }
 
 impl Policy {
@@ -159,6 +182,8 @@ mod tests {
             allowed_ops: vec!["view".into(), "download".into()],
             notify_on_access: false,
             ip_allowlist: None,
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", None));
         assert!(policy.is_access_allowed(Utc::now(), 100, None, "download", None));
@@ -173,6 +198,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: None,
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(!policy.is_access_allowed(Utc::now(), 0, None, "view", None));
     }
@@ -186,6 +213,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: None,
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(policy.is_access_allowed(Utc::now(), 2, None, "view", None));
         assert!(!policy.is_access_allowed(Utc::now(), 3, None, "view", None));
@@ -200,6 +229,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: None,
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(!policy.is_access_allowed(Utc::now(), 0, None, "download", None));
     }
@@ -214,6 +245,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: None,
+            one_shot: false,
+            notarize_on_use: false,
         };
         // 1 hour since first access, TTL is 30 min → denied
         assert!(!policy.is_access_allowed(Utc::now(), 0, Some(first), "view", None));
@@ -228,6 +261,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: Some(vec!["10.0.0.1".into(), "192.168.1.100".into()]),
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("10.0.0.1")));
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("192.168.1.100")));
@@ -242,6 +277,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: Some(vec!["10.0.0.1".into()]),
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(!policy.is_access_allowed(Utc::now(), 0, None, "view", Some("10.0.0.2")));
     }
@@ -255,6 +292,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: Some(vec!["10.0.0.1".into()]),
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(!policy.is_access_allowed(Utc::now(), 0, None, "view", None));
     }
@@ -268,6 +307,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: None,
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("1.2.3.4")));
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", None));
@@ -282,6 +323,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: Some(vec!["10.0.0.0/24".into()]),
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("10.0.0.1")));
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("10.0.0.254")));
@@ -298,6 +341,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: Some(vec!["10.0.0.0/8".into()]),
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("10.255.255.255")));
         assert!(!policy.is_access_allowed(Utc::now(), 0, None, "view", Some("11.0.0.1")));
@@ -312,10 +357,42 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: Some(vec!["fd00::/16".into()]),
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("fd00::1")));
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("fd00:abcd::1")));
         assert!(!policy.is_access_allowed(Utc::now(), 0, None, "view", Some("fe80::1")));
+    }
+
+    #[test]
+    fn test_one_shot_defaults_false_when_absent_in_json() {
+        let policy: Policy = serde_json::from_str("{}").unwrap();
+        assert!(!policy.one_shot);
+        assert!(!policy.notarize_on_use);
+    }
+
+    #[test]
+    fn test_one_shot_round_trip() {
+        let policy = Policy {
+            one_shot: true,
+            notarize_on_use: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(json.contains("\"one_shot\":true"));
+        assert!(json.contains("\"notarize_on_use\":true"));
+        let back: Policy = serde_json::from_str(&json).unwrap();
+        assert!(back.one_shot);
+        assert!(back.notarize_on_use);
+    }
+
+    #[test]
+    fn test_false_flags_omitted_from_json() {
+        let policy = Policy::default();
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(!json.contains("one_shot"));
+        assert!(!json.contains("notarize_on_use"));
     }
 
     #[test]
@@ -327,6 +404,8 @@ mod tests {
             allowed_ops: vec!["view".into()],
             notify_on_access: false,
             ip_allowlist: Some(vec!["192.168.1.50".into(), "10.0.0.0/24".into()]),
+            one_shot: false,
+            notarize_on_use: false,
         };
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("192.168.1.50")));
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("10.0.0.42")));

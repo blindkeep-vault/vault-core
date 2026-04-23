@@ -53,6 +53,12 @@ pub struct CreateItemRequest {
     pub metadata: Option<serde_json::Value>,
     pub size_bytes: Option<i64>,
     pub file_blob_key: Option<String>,
+    /// When true, the item can be read at most once; subsequent reads return 410 Gone.
+    #[serde(default)]
+    pub one_shot: bool,
+    /// When true, each successful read emits a notarized `item.retrieve` attestation.
+    #[serde(default)]
+    pub notarize_on_use: bool,
 }
 
 // --- Grants ---

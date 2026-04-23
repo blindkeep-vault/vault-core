@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+# Mark this crate as its own workspace root so cargo does not walk up the
+# directory tree looking for a parent. Needed inside git worktrees nested
+# under the monorepo; a no-op in the standalone repo and in the monorepo
+# (where the outer workspace already excludes this crate).
+[workspace]
+
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.22"

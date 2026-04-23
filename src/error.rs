@@ -9,6 +9,8 @@ pub enum ApiError {
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
+    #[error("gone")]
+    Gone,
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("payment required")]
@@ -50,6 +52,7 @@ impl ApiError {
             ApiError::NotFound => 404,
             ApiError::Unauthorized => 401,
             ApiError::Forbidden => 403,
+            ApiError::Gone => 410,
             ApiError::BadRequest(_) => 400,
             ApiError::PaymentRequired => 402,
             ApiError::TooManyRequests => 429,
@@ -81,6 +84,7 @@ mod tests {
         assert_eq!(ApiError::NotFound.status_code(), 404);
         assert_eq!(ApiError::Unauthorized.status_code(), 401);
         assert_eq!(ApiError::Forbidden.status_code(), 403);
+        assert_eq!(ApiError::Gone.status_code(), 410);
         assert_eq!(ApiError::BadRequest("x".into()).status_code(), 400);
         assert_eq!(ApiError::PaymentRequired.status_code(), 402);
         assert_eq!(ApiError::TooManyRequests.status_code(), 429);
