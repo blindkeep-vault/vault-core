@@ -17,8 +17,17 @@ pub struct Policy {
     pub notify_on_access: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_allowlist: Option<Vec<String>>,
+    /// Revoke the grant after the first successful retrieval through
+    /// `POST /grants/:id/access`. The revoke runs in the same UPDATE as the
+    /// view-count increment, and subsequent access attempts return 410 Gone.
+    /// Governs grant-based access only — the underlying item's `one_shot`
+    /// flag (if any) governs direct owner/API-key reads independently.
     #[serde(default, skip_serializing_if = "is_false")]
     pub one_shot: bool,
+    /// Emit a notarized `grant.retrieve` event on every successful retrieval
+    /// through `POST /grants/:id/access`. The notarization commits in the same
+    /// transaction as the view-count increment, so there is no window where a
+    /// retrieval succeeded but was never attested.
     #[serde(default, skip_serializing_if = "is_false")]
     pub notarize_on_use: bool,
 }

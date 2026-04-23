@@ -53,10 +53,19 @@ pub struct CreateItemRequest {
     pub metadata: Option<serde_json::Value>,
     pub size_bytes: Option<i64>,
     pub file_blob_key: Option<String>,
-    /// When true, the item can be read at most once; subsequent reads return 410 Gone.
+    /// Consume the item on the first direct read via `GET /items/:id` or
+    /// `GET /items/:id/blob` (owner JWT or API-key JWT), atomically setting
+    /// `consumed_at`; subsequent direct reads return 410 Gone.
+    ///
+    /// Scope: direct reads ONLY. Grant-based access via `POST /grants/:id/access`
+    /// goes through a separate retrieval path whose atomicity is governed by
+    /// the grant's own `policy.one_shot` flag. If you need one-shot semantics
+    /// for a credential handed off to another user, set `one_shot` on the grant,
+    /// not on the underlying item.
     #[serde(default)]
     pub one_shot: bool,
-    /// When true, each successful read emits a notarized `item.retrieve` attestation.
+    /// When true, each successful direct read emits a notarized `item.retrieve`
+    /// attestation. Same scope caveat as `one_shot`: direct reads only.
     #[serde(default)]
     pub notarize_on_use: bool,
 }
