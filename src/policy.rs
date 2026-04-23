@@ -177,6 +177,50 @@ fn ip_in_cidr(addr: IpAddr, network: IpAddr, prefix_len: u32) -> bool {
     }
 }
 
+/// Classification-driven handling rules.
+///
+/// The rule table (per feature request) maps each classification level to
+/// which operations are permitted. Predicates here encode that table — callers
+/// (API / CLI) are responsible for turning a `false` return into an
+/// [`ApiError::PolicyDenied`](crate::error::ApiError::PolicyDenied) with
+/// whatever message makes sense at the call site.
+///
+/// Keeping this as pure predicates (rather than `Result`-returning helpers)
+/// lets the same table drive both the API refusal path and UI affordances
+/// (e.g. forcing a one-shot toggle on when `requires_protected_grant` is
+/// `true`).
+pub mod classification {
+    use crate::error::ApiError;
+    use crate::policy::Policy;
+    use crate::types::Classification;
+
+    /// Whether a direct grant for an item of this classification must be
+    /// created with `one_shot` (or, once implemented, MFA-gated retrieval).
+    /// `Confidential` and `Restricted` both require a protected grant so that
+    /// access is either single-use or interactively re-authenticated.
+    pub fn requires_protected_grant(c: Classification) -> bool {
+        matches!(c, Classification::Confidential | Classification::Restricted)
+    }
+
+    /// Enforce the grant rule: if the item's classification requires a
+    /// protected grant, the policy must set `one_shot`. Returns
+    /// [`ApiError::PolicyDenied`] otherwise. Unclassified / `Public` /
+    /// `Standard` items pass through unchanged.
+    ///
+    /// This is the single point that translates the rule table into an API
+    /// refusal — tests here nail down every classification × `one_shot`
+    /// combination so the behavior at the boundary doesn't drift.
+    pub fn enforce_grant_policy(c: Classification, policy: &Policy) -> Result<(), ApiError> {
+        if requires_protected_grant(c) && !policy.one_shot {
+            return Err(ApiError::PolicyDenied(format!(
+                "grants for {} items must set one_shot",
+                c.as_str()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +463,56 @@ mod tests {
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("192.168.1.50")));
         assert!(policy.is_access_allowed(Utc::now(), 0, None, "view", Some("10.0.0.42")));
         assert!(!policy.is_access_allowed(Utc::now(), 0, None, "view", Some("192.168.1.51")));
+    }
+
+    mod classification_rules {
+        use super::super::classification::*;
+        use crate::error::ApiError;
+        use crate::policy::Policy;
+        use crate::types::Classification;
+
+        #[test]
+        fn protected_grant_required_for_confidential_and_restricted() {
+            assert!(!requires_protected_grant(Classification::Public));
+            assert!(!requires_protected_grant(Classification::Standard));
+            assert!(requires_protected_grant(Classification::Confidential));
+            assert!(requires_protected_grant(Classification::Restricted));
+        }
+
+        fn policy_with_one_shot(one_shot: bool) -> Policy {
+            Policy {
+                one_shot,
+                ..Policy::default()
+            }
+        }
+
+        #[test]
+        fn enforce_grant_accepts_public_and_standard_regardless_of_one_shot() {
+            for c in [Classification::Public, Classification::Standard] {
+                assert!(enforce_grant_policy(c, &policy_with_one_shot(false)).is_ok());
+                assert!(enforce_grant_policy(c, &policy_with_one_shot(true)).is_ok());
+            }
+        }
+
+        #[test]
+        fn enforce_grant_refuses_confidential_and_restricted_without_one_shot() {
+            for c in [Classification::Confidential, Classification::Restricted] {
+                let err =
+                    enforce_grant_policy(c, &policy_with_one_shot(false)).expect_err("must deny");
+                assert!(
+                    matches!(err, ApiError::PolicyDenied(ref m) if m.contains(c.as_str())),
+                    "expected PolicyDenied mentioning {}, got {:?}",
+                    c.as_str(),
+                    err,
+                );
+            }
+        }
+
+        #[test]
+        fn enforce_grant_accepts_confidential_and_restricted_with_one_shot() {
+            for c in [Classification::Confidential, Classification::Restricted] {
+                assert!(enforce_grant_policy(c, &policy_with_one_shot(true)).is_ok());
+            }
+        }
     }
 }

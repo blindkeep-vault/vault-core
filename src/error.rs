@@ -19,6 +19,13 @@ pub enum ApiError {
     TooManyRequests,
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The request is well-formed and the caller is authorized, but the
+    /// operation is refused by a handling policy (e.g. attempting to create an
+    /// anonymous drop of a `Restricted`-classified item). Distinct from
+    /// `Forbidden` so callers can surface policy violations separately from
+    /// access-control denials.
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -57,6 +64,7 @@ impl ApiError {
             ApiError::PaymentRequired => 402,
             ApiError::TooManyRequests => 429,
             ApiError::Conflict(_) => 409,
+            ApiError::PolicyDenied(_) => 422,
             ApiError::Internal(_) => 500,
         }
     }
@@ -77,6 +85,10 @@ mod tests {
             ApiError::Conflict("already exists".into()).to_string(),
             "conflict: already exists"
         );
+        assert_eq!(
+            ApiError::PolicyDenied("restricted items cannot be dropped".into()).to_string(),
+            "policy denied: restricted items cannot be dropped"
+        );
     }
 
     #[test]
@@ -89,6 +101,7 @@ mod tests {
         assert_eq!(ApiError::PaymentRequired.status_code(), 402);
         assert_eq!(ApiError::TooManyRequests.status_code(), 429);
         assert_eq!(ApiError::Conflict("x".into()).status_code(), 409);
+        assert_eq!(ApiError::PolicyDenied("x".into()).status_code(), 422);
         assert_eq!(ApiError::Internal("x".into()).status_code(), 500);
     }
 

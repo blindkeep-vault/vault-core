@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::types::Classification;
+
 // --- Auth ---
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +52,11 @@ pub struct CreateItemRequest {
     pub wrapped_key: Vec<u8>,
     pub nonce: Vec<u8>,
     pub item_type: String,
+    /// Data-handling classification for this item (issue #9). Omitting the
+    /// field lands on `Standard`, matching today's behavior. Future slices
+    /// enforce handling rules (e.g. `Confidential` requires one-shot grants).
+    #[serde(default)]
+    pub classification: Classification,
     pub metadata: Option<serde_json::Value>,
     pub size_bytes: Option<i64>,
     pub file_blob_key: Option<String>,

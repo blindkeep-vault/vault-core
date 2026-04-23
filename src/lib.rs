@@ -28,5 +28,5 @@ pub use crypto::{
     unwrap_key, wrap_key_for_grant, wrap_key_for_recipient,
 };
 pub use policy::Policy;
-pub use types::{AuditEntry, Grant, GrantStatus, Item, ItemType, User};
+pub use types::{AuditEntry, Classification, Grant, GrantStatus, Item, ItemType, User};
 pub use zeroize::Zeroizing;
