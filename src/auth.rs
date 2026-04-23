@@ -14,8 +14,8 @@ fn jwt_validation() -> Validation {
 /// - `Full` — client has (or can derive) the vault master key: password login,
 ///   passkey+PRF login, API key auth, legacy tokens.
 /// - `Limited` — authenticated via magic link only; the server has no evidence
-///   the client holds the vault key. Server endpoints that operate on vault
-///   content reject this tier (see `require_full_session`).
+///   the client holds the vault key. The server's auth middleware enforces a
+///   path allow-list for this tier; vault-content routes return 403.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
@@ -86,10 +86,10 @@ pub fn encode_jwt_full(
 
 /// Issue a Limited session JWT (magic-link login: authenticated but vault locked).
 ///
-/// Routes that need the vault master key on the client must reject this tier
-/// via `require_full_session`. The client can swap this for a `Full` JWT via
-/// the `/auth/upgrade-session` endpoint by supplying the password-derived
-/// `auth_key`.
+/// The auth middleware's path allow-list blocks this tier from routes that
+/// need the vault master key on the client. The client can swap this for a
+/// `Full` JWT via the `/auth/upgrade-session` endpoint by supplying the
+/// password-derived `auth_key`.
 pub fn encode_jwt_limited(
     user_id: Uuid,
     email: &str,
