@@ -75,11 +75,18 @@ pub struct CreateItemRequest {
     /// attestation. Same scope caveat as `one_shot`: direct reads only.
     #[serde(default)]
     pub notarize_on_use: bool,
+    /// Cascade-revocation tag (issue #7). Validated by
+    /// [`crate::types::validate_scope_tag`]. `None` leaves the item unscoped
+    /// and outside any future tombstone cascade — preserves today's behavior
+    /// for callers that don't opt in.
+    #[serde(default)]
+    pub scope_tag: Option<String>,
 }
 
 /// Reclassify an existing item. `acknowledge_grant_breakage = true` opts the
 /// caller into proceeding when the new classification would leave an active
-/// grant non-compliant under [`policy::classification::enforce_grant_policy`].
+/// grant non-compliant under
+/// [`policy::classification::ClassificationPolicy::enforce_grant_policy`].
 /// Downgrades are always notarized regardless of this flag (issue #9 acceptance
 /// gap, #42).
 #[derive(Debug, Deserialize)]
@@ -103,6 +110,12 @@ pub struct CreateGrantRequest {
     pub claim_ciphertext: Option<Vec<u8>>,
     pub group_id: Option<Uuid>,
     pub wrapped_item_keys: Option<serde_json::Value>,
+    /// Cascade-revocation tag (issue #7). Independent from the grantee's
+    /// own item scope: e.g. a contractor on scope `acme/pentest-q2` may be
+    /// granted access to items outside that scope, but the grant itself
+    /// tombstones with the engagement.
+    #[serde(default)]
+    pub scope_tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +141,11 @@ pub struct CreateApiKeyRequest {
     #[serde(default)]
     pub scopes: Option<serde_json::Value>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Cascade-revocation tag (issue #7). Not to be confused with the
+    /// `scopes` JSONB above, which holds unrelated RBAC-style permissions
+    /// (`{"read_only": true}`, …). See [`crate::types::validate_scope_tag`].
+    #[serde(default)]
+    pub scope_tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +155,14 @@ pub struct CreateApiKeyResponse {
     pub key_prefix: String,
     pub public_key: Option<Vec<u8>>,
     pub created_at: String,
+    /// Echo of the tag the server persisted, so the caller can verify
+    /// that what landed in storage matches what they sent — important
+    /// because a mistyped tag would silently miss the future tombstone
+    /// cascade. Absent for unscoped keys (the caller sent no tag), which
+    /// also keeps this response byte-identical to the pre-#7 wire format
+    /// for the unscoped path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +177,8 @@ pub struct ApiKeyListItem {
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,4 +227,58 @@ pub struct PublicKeyQuery {
 #[derive(Debug, Serialize)]
 pub struct PublicKeyResponse {
     pub public_key: Vec<u8>,
+}
+
+// --- Decisions (issue #5) ---
+
+/// Record a notarized approval decision. The encrypted blob holds the
+/// rationale (encrypted client-side with the caller's master key, like any
+/// other item); the structured fields land plaintext in `decisions` and
+/// drive the GET /decisions filter API.
+///
+/// `approver` defaults to the caller's user-id stringified — pass an
+/// explicit value when recording a decision on behalf of an external party
+/// (a counterparty signature, an external system's identity).
+///
+/// `supersedes` chains a follow-up decision onto a prior one; the server
+/// enforces that both belong to the same `approver_user_id` to prevent
+/// cross-account chain forgery.
+#[derive(Debug, Deserialize)]
+pub struct RecordDecisionRequest {
+    pub encrypted_blob: String,
+    pub wrapped_key: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub action: String,
+    pub target: String,
+    #[serde(default)]
+    pub approver: Option<String>,
+    #[serde(default)]
+    pub supersedes: Option<Uuid>,
+    /// Caller-supplied decision time, used for backfilling historical
+    /// approvals. Defaults to record time on the server.
+    #[serde(default)]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// Per-item handling tag, same as `CreateItemRequest.classification`.
+    #[serde(default)]
+    pub classification: crate::types::Classification,
+}
+
+// --- Scope tombstone (issue #7) ---
+
+/// Tombstone a scope_tag: revoke grants, kill api_keys (and their item
+/// grants), freeze items, write a notarized `scope.tombstone` event. One
+/// cascade, one ledger row, fully idempotent — a second POST on the same
+/// `(user, scope_tag)` returns the existing row unchanged.
+///
+/// `retention_days` is the retention boundary clients see as `--retention
+/// 90d`. `None` defaults to 90 days server-side; explicit values are
+/// clamped to a safe range so a stray `0` or an absurd huge value can't
+/// bend the retention sweep.
+#[derive(Debug, Deserialize)]
+pub struct TombstoneScopeRequest {
+    pub scope_tag: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub retention_days: Option<u32>,
 }

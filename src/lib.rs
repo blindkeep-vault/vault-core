@@ -4,6 +4,7 @@ pub mod bindings;
 #[cfg(feature = "client")]
 pub mod client;
 pub mod crypto;
+pub mod decisions;
 #[cfg(feature = "drops")]
 pub mod drops;
 pub mod envelope;
@@ -28,5 +29,8 @@ pub use crypto::{
     unwrap_key, wrap_key_for_grant, wrap_key_for_recipient,
 };
 pub use policy::Policy;
-pub use types::{AuditEntry, Classification, Grant, GrantStatus, Item, ItemType, User};
+pub use types::{
+    validate_scope_tag, AuditEntry, Classification, Decision, Grant, GrantStatus, Item, ItemType,
+    User, SCOPE_TAG_MAX_LEN,
+};
 pub use zeroize::Zeroizing;

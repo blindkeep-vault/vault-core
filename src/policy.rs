@@ -179,45 +179,97 @@ fn ip_in_cidr(addr: IpAddr, network: IpAddr, prefix_len: u32) -> bool {
 
 /// Classification-driven handling rules.
 ///
-/// The rule table (per feature request) maps each classification level to
-/// which operations are permitted. Predicates here encode that table — callers
-/// (API / CLI) are responsible for turning a `false` return into an
-/// [`ApiError::PolicyDenied`](crate::error::ApiError::PolicyDenied) with
-/// whatever message makes sense at the call site.
-///
-/// Keeping this as pure predicates (rather than `Result`-returning helpers)
-/// lets the same table drive both the API refusal path and UI affordances
-/// (e.g. forcing a one-shot toggle on when `requires_protected_grant` is
-/// `true`).
+/// The rule table maps each classification level to which grant policies are
+/// permitted. [`ClassificationPolicy`] reifies that table so operators can
+/// override stricter handling per deployment without forking the crate — see
+/// issue #43. The default matches the historical hardcoded behavior byte-for-
+/// byte, so callers that omit a config observe no change.
 pub mod classification {
+    use serde::{Deserialize, Serialize};
+
     use crate::error::ApiError;
     use crate::policy::Policy;
     use crate::types::Classification;
 
-    /// Whether a direct grant for an item of this classification must be
-    /// created with `one_shot` (or, once implemented, MFA-gated retrieval).
-    /// `Confidential` and `Restricted` both require a protected grant so that
-    /// access is either single-use or interactively re-authenticated.
-    pub fn requires_protected_grant(c: Classification) -> bool {
-        matches!(c, Classification::Confidential | Classification::Restricted)
+    /// Stable, canonical index into `ClassificationPolicy` arrays:
+    /// `Public=0, Standard=1, Confidential=2, Restricted=3`. Kept as a `const
+    /// fn` so the mapping is a single compile-time source of truth — the
+    /// `index_matches_classification_variants` test pins the ordering so
+    /// reordering the enum cannot silently corrupt the rule table.
+    pub const fn index(c: Classification) -> usize {
+        match c {
+            Classification::Public => 0,
+            Classification::Standard => 1,
+            Classification::Confidential => 2,
+            Classification::Restricted => 3,
+        }
     }
 
-    /// Enforce the grant rule: if the item's classification requires a
-    /// protected grant, the policy must set `one_shot`. Returns
-    /// [`ApiError::PolicyDenied`] otherwise. Unclassified / `Public` /
-    /// `Standard` items pass through unchanged.
+    /// Config-driven classification rule table. Fields are arrays indexed by
+    /// [`index`] — `[Public, Standard, Confidential, Restricted]`.
     ///
-    /// This is the single point that translates the rule table into an API
-    /// refusal — tests here nail down every classification × `one_shot`
-    /// combination so the behavior at the boundary doesn't drift.
-    pub fn enforce_grant_policy(c: Classification, policy: &Policy) -> Result<(), ApiError> {
-        if requires_protected_grant(c) && !policy.one_shot {
-            return Err(ApiError::PolicyDenied(format!(
-                "grants for {} items must set one_shot",
-                c.as_str()
-            )));
+    /// [`Self::default`] matches the pre-refactor hardcoded table: Confidential
+    /// and Restricted both require a protected (one-shot, or once MFA lands,
+    /// step-up-re-authenticated) grant. Operators who need stricter handling
+    /// override via JSON config at startup — see [`Self::from_json_str`].
+    ///
+    /// Missing / malformed config must fail on startup, not at request time.
+    /// The `deny_unknown_fields` attribute turns a typo in the config file
+    /// into a hard error instead of a silently-ignored setting.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct ClassificationPolicy {
+        /// Whether a grant for an item at each classification level must set
+        /// `policy.one_shot`. Indexed by [`index`].
+        pub requires_one_shot: [bool; 4],
+    }
+
+    impl Default for ClassificationPolicy {
+        fn default() -> Self {
+            // Matches the pre-refactor hardcoded table:
+            // `Confidential` and `Restricted` require a protected grant.
+            Self {
+                requires_one_shot: [false, false, true, true],
+            }
         }
-        Ok(())
+    }
+
+    impl ClassificationPolicy {
+        /// Deserialize from JSON, with a startup-appropriate error message.
+        /// JSON (rather than TOML) keeps the dependency footprint identical to
+        /// what vault-core already carries via `serde_json`.
+        pub fn from_json_str(s: &str) -> Result<Self, String> {
+            serde_json::from_str(s)
+                .map_err(|e| format!("invalid classification policy config: {e}"))
+        }
+
+        /// Whether a direct grant for an item of this classification must be
+        /// created with `one_shot` (or, once implemented, MFA-gated retrieval).
+        pub fn requires_protected_grant(&self, c: Classification) -> bool {
+            self.requires_one_shot[index(c)]
+        }
+
+        /// Enforce the grant rule: if the item's classification requires a
+        /// protected grant, the policy must set `one_shot`. Returns
+        /// [`ApiError::PolicyDenied`] otherwise. Classifications whose
+        /// `requires_one_shot` entry is `false` pass through unchanged.
+        ///
+        /// Single point that translates the rule table into an API refusal —
+        /// tests nail down every classification × `one_shot` combination so
+        /// the behavior at the boundary doesn't drift.
+        pub fn enforce_grant_policy(
+            &self,
+            c: Classification,
+            policy: &Policy,
+        ) -> Result<(), ApiError> {
+            if self.requires_protected_grant(c) && !policy.one_shot {
+                return Err(ApiError::PolicyDenied(format!(
+                    "grants for {} items must set one_shot",
+                    c.as_str()
+                )));
+            }
+            Ok(())
+        }
     }
 
     /// Enforce the api-key grant rule. api_key_grants are persistent
@@ -265,7 +317,9 @@ pub mod classification {
     }
 
     /// True when `new` is strictly less strict than `old` (e.g. `Restricted` →
-    /// `Standard`). Upgrades and no-ops return `false`.
+    /// `Standard`). Upgrades and no-ops return `false`. Ordering is a
+    /// classification *property*, not a rule-table entry, so this stays a free
+    /// fn rather than a method on [`ClassificationPolicy`].
     pub fn is_downgrade(old: Classification, new: Classification) -> bool {
         strictness(new) < strictness(old)
     }
@@ -530,12 +584,25 @@ mod tests {
         use crate::policy::Policy;
         use crate::types::Classification;
 
+        /// Canonical ordering pin: if anyone reorders `Classification`
+        /// variants, this test fails loudly — any array-indexed field in
+        /// `ClassificationPolicy` would otherwise silently shift meaning.
         #[test]
-        fn protected_grant_required_for_confidential_and_restricted() {
-            assert!(!requires_protected_grant(Classification::Public));
-            assert!(!requires_protected_grant(Classification::Standard));
-            assert!(requires_protected_grant(Classification::Confidential));
-            assert!(requires_protected_grant(Classification::Restricted));
+        fn index_matches_classification_variants() {
+            assert_eq!(index(Classification::Public), 0);
+            assert_eq!(index(Classification::Standard), 1);
+            assert_eq!(index(Classification::Confidential), 2);
+            assert_eq!(index(Classification::Restricted), 3);
+        }
+
+        #[test]
+        fn default_matches_pre_refactor_hardcoded_table() {
+            // Byte-for-byte equivalence with the old hardcoded predicates.
+            let p = ClassificationPolicy::default();
+            assert!(!p.requires_protected_grant(Classification::Public));
+            assert!(!p.requires_protected_grant(Classification::Standard));
+            assert!(p.requires_protected_grant(Classification::Confidential));
+            assert!(p.requires_protected_grant(Classification::Restricted));
         }
 
         fn policy_with_one_shot(one_shot: bool) -> Policy {
@@ -547,17 +614,24 @@ mod tests {
 
         #[test]
         fn enforce_grant_accepts_public_and_standard_regardless_of_one_shot() {
+            let p = ClassificationPolicy::default();
             for c in [Classification::Public, Classification::Standard] {
-                assert!(enforce_grant_policy(c, &policy_with_one_shot(false)).is_ok());
-                assert!(enforce_grant_policy(c, &policy_with_one_shot(true)).is_ok());
+                assert!(p
+                    .enforce_grant_policy(c, &policy_with_one_shot(false))
+                    .is_ok());
+                assert!(p
+                    .enforce_grant_policy(c, &policy_with_one_shot(true))
+                    .is_ok());
             }
         }
 
         #[test]
         fn enforce_grant_refuses_confidential_and_restricted_without_one_shot() {
+            let p = ClassificationPolicy::default();
             for c in [Classification::Confidential, Classification::Restricted] {
-                let err =
-                    enforce_grant_policy(c, &policy_with_one_shot(false)).expect_err("must deny");
+                let err = p
+                    .enforce_grant_policy(c, &policy_with_one_shot(false))
+                    .expect_err("must deny");
                 assert!(
                     matches!(err, ApiError::PolicyDenied(ref m) if m.contains(c.as_str())),
                     "expected PolicyDenied mentioning {}, got {:?}",
@@ -569,9 +643,79 @@ mod tests {
 
         #[test]
         fn enforce_grant_accepts_confidential_and_restricted_with_one_shot() {
+            let p = ClassificationPolicy::default();
             for c in [Classification::Confidential, Classification::Restricted] {
-                assert!(enforce_grant_policy(c, &policy_with_one_shot(true)).is_ok());
+                assert!(p
+                    .enforce_grant_policy(c, &policy_with_one_shot(true))
+                    .is_ok());
             }
+        }
+
+        /// Acceptance from issue #43: operator override of `requires_one_shot`
+        /// changes enforcement at request time with no code change.
+        #[test]
+        fn custom_policy_can_tighten_standard_to_require_one_shot() {
+            let p = ClassificationPolicy {
+                requires_one_shot: [false, true, true, true],
+            };
+            assert!(p.requires_protected_grant(Classification::Standard));
+            let err = p
+                .enforce_grant_policy(Classification::Standard, &policy_with_one_shot(false))
+                .expect_err("tightened Standard must refuse non-one-shot grant");
+            assert!(matches!(err, ApiError::PolicyDenied(_)));
+            assert!(p
+                .enforce_grant_policy(Classification::Standard, &policy_with_one_shot(true))
+                .is_ok());
+        }
+
+        #[test]
+        fn custom_policy_can_loosen_confidential_to_allow_any_grant() {
+            let p = ClassificationPolicy {
+                requires_one_shot: [false, false, false, true],
+            };
+            assert!(p
+                .enforce_grant_policy(Classification::Confidential, &policy_with_one_shot(false))
+                .is_ok());
+            // Restricted unchanged.
+            assert!(p
+                .enforce_grant_policy(Classification::Restricted, &policy_with_one_shot(false))
+                .is_err());
+        }
+
+        #[test]
+        fn from_json_str_parses_full_table() {
+            let json = r#"{"requires_one_shot":[false,true,true,true]}"#;
+            let p = ClassificationPolicy::from_json_str(json).expect("valid config");
+            assert!(!p.requires_protected_grant(Classification::Public));
+            assert!(p.requires_protected_grant(Classification::Standard));
+            assert!(p.requires_protected_grant(Classification::Confidential));
+            assert!(p.requires_protected_grant(Classification::Restricted));
+        }
+
+        #[test]
+        fn from_json_str_rejects_malformed_input() {
+            // Wrong array length — serde fails before enforcement ever runs.
+            assert!(
+                ClassificationPolicy::from_json_str(r#"{"requires_one_shot":[true,true]}"#)
+                    .is_err()
+            );
+            // Missing required field.
+            assert!(ClassificationPolicy::from_json_str("{}").is_err());
+            // Unknown field — typo in config must be a hard error.
+            assert!(ClassificationPolicy::from_json_str(
+                r#"{"requires_one_shot":[false,false,true,true],"allows_drop":[true,true,true,true]}"#
+            )
+            .is_err());
+            // Not JSON at all.
+            assert!(ClassificationPolicy::from_json_str("not json").is_err());
+        }
+
+        #[test]
+        fn default_round_trips_through_json() {
+            let p = ClassificationPolicy::default();
+            let json = serde_json::to_string(&p).unwrap();
+            let back = ClassificationPolicy::from_json_str(&json).unwrap();
+            assert_eq!(p, back);
         }
 
         #[test]

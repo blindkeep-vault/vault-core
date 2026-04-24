@@ -49,6 +49,46 @@ impl Classification {
     }
 }
 
+/// Maximum length of a validated `scope_tag`. Chosen to fit comfortably inside
+/// a Postgres btree index leaf entry alongside a small tuple header, while
+/// giving callers enough room for `org/team/workspace`-style nested namespaces.
+pub const SCOPE_TAG_MAX_LEN: usize = 64;
+
+/// Validate a `scope_tag` value (issue #7). A valid tag is 1..=64 ASCII
+/// characters drawn from `[a-z0-9\-_./]`, starting with `[a-z0-9]`, with no
+/// whitespace and no uppercase. The constraint keeps scope tags URL-safe,
+/// shell-safe, and log-safe so callers can paste them unescaped into paths,
+/// audit entries, and notarized events without a second normalization step.
+///
+/// Centralized here so server, CLI, and WASM bindings reject the same set.
+/// Returns `Ok(())` when the input is valid, `Err(&'static str)` with a short
+/// reason otherwise — the API handler maps it to a 400.
+pub fn validate_scope_tag(tag: &str) -> Result<(), &'static str> {
+    if tag.is_empty() {
+        return Err("scope_tag must not be empty");
+    }
+    if tag.len() > SCOPE_TAG_MAX_LEN {
+        return Err("scope_tag exceeds 64 characters");
+    }
+    let mut chars = tag.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err("scope_tag must start with a lowercase letter or digit");
+    }
+    for c in std::iter::once(first).chain(chars) {
+        let ok = c.is_ascii_lowercase()
+            || c.is_ascii_digit()
+            || c == '-'
+            || c == '_'
+            || c == '.'
+            || c == '/';
+        if !ok {
+            return Err("scope_tag may only contain [a-z0-9-_./]");
+        }
+    }
+    Ok(())
+}
+
 impl std::str::FromStr for Classification {
     type Err = &'static str;
 
@@ -80,6 +120,11 @@ pub struct Item {
     pub classification: Classification,
     pub metadata: serde_json::Value,
     pub storage_backend: String,
+    /// Opaque cascade-revocation tag (issue #7). Present when the item was
+    /// created inside a named scope (tenant, project, engagement). Unscoped
+    /// items carry `None` and are not eligible for scope-wide tombstoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_tag: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -117,9 +162,36 @@ pub struct Grant {
     pub policy: serde_json::Value,
     pub status: GrantStatus,
     pub view_count: i32,
+    /// Opaque cascade-revocation tag (issue #7). See [`Item::scope_tag`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_tag: Option<String>,
     pub created_at: DateTime<Utc>,
     pub claimed_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Notarized approval-decision (issue #5). Each row pairs 1:1 with an
+/// `items` row of the same id — that item carries the encrypted rationale,
+/// while the structured fields here (`approver`, `action`, `target`,
+/// `supersedes`) stay plaintext to support the GET /decisions filter API.
+///
+/// `decided_at` is when the approval was made (caller-supplied, defaulting
+/// to record time); `created_at` is when the row was persisted. For
+/// imported / backfilled decisions the two diverge — the notarization
+/// timestamp anchors the latter, not the former.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Decision {
+    /// Same value as the underlying `items.id`. Decisions ARE items at the
+    /// storage layer; this is the same UUID, surfaced under a friendlier name.
+    pub id: Uuid,
+    pub approver_user_id: Uuid,
+    pub approver: String,
+    pub action: String,
+    pub target: String,
+    pub supersedes: Option<Uuid>,
+    pub decided_at: DateTime<Utc>,
+    pub notarization_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,13 +419,40 @@ mod tests {
             classification: Classification::Confidential,
             metadata: serde_json::json!({}),
             storage_backend: "managed".to_string(),
+            scope_tag: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains("\"classification\":\"confidential\""));
+        // Unscoped item serializes without a `scope_tag` key so unscoped rows
+        // stay byte-identical to the pre-#7 wire format.
+        assert!(!json.contains("scope_tag"));
         let parsed: Item = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.classification, Classification::Confidential);
+        assert_eq!(parsed.scope_tag, None);
+    }
+
+    #[test]
+    fn item_serde_roundtrip_with_scope_tag() {
+        let item = Item {
+            id: Uuid::new_v4(),
+            owner_id: Uuid::new_v4(),
+            encrypted_blob: "blob".to_string(),
+            wrapped_key: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+            item_type: ItemType::Password,
+            classification: Classification::Standard,
+            metadata: serde_json::json!({}),
+            storage_backend: "managed".to_string(),
+            scope_tag: Some("acme/prod".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"scope_tag\":\"acme/prod\""));
+        let parsed: Item = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.scope_tag.as_deref(), Some("acme/prod"));
     }
 
     #[test]
@@ -375,6 +474,53 @@ mod tests {
         });
         let parsed: Item = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.classification, Classification::Standard);
+    }
+
+    #[test]
+    fn validate_scope_tag_accepts_canonical_forms() {
+        for tag in [
+            "acme",
+            "acme-prod",
+            "acme_prod",
+            "acme.prod",
+            "acme/prod",
+            "t1/team-a/app_1",
+            "0pentest",
+            "a",
+            &"a".repeat(SCOPE_TAG_MAX_LEN),
+        ] {
+            assert!(
+                validate_scope_tag(tag).is_ok(),
+                "expected {tag:?} to validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_scope_tag_rejects_bad_inputs() {
+        for tag in [
+            "",
+            " acme",          // leading space
+            "acme ",          // trailing space
+            "Acme",           // uppercase
+            "acme!",          // punctuation
+            "-acme",          // starts with dash
+            "_acme",          // starts with underscore
+            "/acme",          // starts with slash
+            ".acme",          // starts with dot
+            "acme\nprod",     // newline
+            "acme\tprod",     // tab
+            "acme/prod:read", // colon
+            "日本語",         // non-ASCII
+        ] {
+            assert!(
+                validate_scope_tag(tag).is_err(),
+                "expected {tag:?} to be rejected"
+            );
+        }
+        // Length cap: 65 chars must fail (boundary one past the limit).
+        let too_long = "a".repeat(SCOPE_TAG_MAX_LEN + 1);
+        assert!(validate_scope_tag(&too_long).is_err());
     }
 
     #[test]
