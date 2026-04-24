@@ -219,6 +219,65 @@ pub mod classification {
         }
         Ok(())
     }
+
+    /// Enforce the api-key grant rule. api_key_grants are persistent
+    /// wrapped-key handoffs: they carry no per-grant `Policy`, so the
+    /// one_shot-based check used for user grants does not apply. The analog
+    /// is the parent api_key's scope. The table:
+    ///
+    /// - `Public` / `Standard`: any api_key_grant is fine.
+    /// - `Confidential`: the parent api_key must be `read_only`, so the grant
+    ///   can observe but never mutate the item.
+    /// - `Restricted`: refused outright — there is no api_key equivalent of a
+    ///   `one_shot` single-use retrieval today.
+    ///
+    /// Keeps the `patch_item_classification` grant-compliance scan symmetric
+    /// with the user-grant path (issue #58 follow-up to #42).
+    pub fn enforce_api_key_grant_policy(
+        c: Classification,
+        api_key_read_only: bool,
+    ) -> Result<(), ApiError> {
+        match c {
+            Classification::Public | Classification::Standard => Ok(()),
+            Classification::Confidential if api_key_read_only => Ok(()),
+            Classification::Confidential => Err(ApiError::PolicyDenied(format!(
+                "api_key grants for {} items require a read_only api_key",
+                c.as_str()
+            ))),
+            Classification::Restricted => Err(ApiError::PolicyDenied(format!(
+                "api_key grants are not allowed for {} items",
+                c.as_str()
+            ))),
+        }
+    }
+
+    /// Ordered strictness: higher is stricter. `Restricted` > `Confidential` >
+    /// `Standard` > `Public`. Kept private so the ordering is never exposed as
+    /// a meaningful numeric ABI — callers use `is_downgrade` /
+    /// `downgrade_requires_notarization` instead.
+    const fn strictness(c: Classification) -> u8 {
+        match c {
+            Classification::Public => 0,
+            Classification::Standard => 1,
+            Classification::Confidential => 2,
+            Classification::Restricted => 3,
+        }
+    }
+
+    /// True when `new` is strictly less strict than `old` (e.g. `Restricted` →
+    /// `Standard`). Upgrades and no-ops return `false`.
+    pub fn is_downgrade(old: Classification, new: Classification) -> bool {
+        strictness(new) < strictness(old)
+    }
+
+    /// Whether a reclassify from `old` to `new` must be notarized. The spec's
+    /// *Acceptance* for issue #9 only requires notarization on downgrades, so
+    /// upgrades and no-ops return `false`. The predicate is the single point
+    /// of policy — the route handler must consult it before deciding to skip
+    /// the notarization step.
+    pub fn downgrade_requires_notarization(old: Classification, new: Classification) -> bool {
+        is_downgrade(old, new)
+    }
 }
 
 #[cfg(test)]
@@ -512,6 +571,74 @@ mod tests {
         fn enforce_grant_accepts_confidential_and_restricted_with_one_shot() {
             for c in [Classification::Confidential, Classification::Restricted] {
                 assert!(enforce_grant_policy(c, &policy_with_one_shot(true)).is_ok());
+            }
+        }
+
+        #[test]
+        fn enforce_api_key_grant_accepts_public_and_standard_regardless_of_scope() {
+            for c in [Classification::Public, Classification::Standard] {
+                assert!(enforce_api_key_grant_policy(c, false).is_ok());
+                assert!(enforce_api_key_grant_policy(c, true).is_ok());
+            }
+        }
+
+        #[test]
+        fn enforce_api_key_grant_confidential_requires_read_only() {
+            let err = enforce_api_key_grant_policy(Classification::Confidential, false)
+                .expect_err("writable api_key must be refused on confidential");
+            assert!(
+                matches!(err, ApiError::PolicyDenied(ref m) if m.contains("read_only")),
+                "expected PolicyDenied mentioning read_only, got {err:?}",
+            );
+            assert!(enforce_api_key_grant_policy(Classification::Confidential, true).is_ok());
+        }
+
+        #[test]
+        fn enforce_api_key_grant_refuses_restricted_always() {
+            for read_only in [false, true] {
+                let err = enforce_api_key_grant_policy(Classification::Restricted, read_only)
+                    .expect_err("restricted must refuse api_key grants regardless of scope");
+                assert!(
+                    matches!(err, ApiError::PolicyDenied(ref m) if m.contains("restricted")),
+                    "expected PolicyDenied mentioning restricted, got {err:?}",
+                );
+            }
+        }
+
+        #[test]
+        fn is_downgrade_detects_relaxations() {
+            use Classification::*;
+            assert!(is_downgrade(Restricted, Confidential));
+            assert!(is_downgrade(Restricted, Standard));
+            assert!(is_downgrade(Restricted, Public));
+            assert!(is_downgrade(Confidential, Standard));
+            assert!(is_downgrade(Confidential, Public));
+            assert!(is_downgrade(Standard, Public));
+        }
+
+        #[test]
+        fn is_downgrade_rejects_upgrades_and_noops() {
+            use Classification::*;
+            for c in [Public, Standard, Confidential, Restricted] {
+                assert!(!is_downgrade(c, c), "{c:?} → {c:?} must not be a downgrade");
+            }
+            assert!(!is_downgrade(Public, Standard));
+            assert!(!is_downgrade(Standard, Confidential));
+            assert!(!is_downgrade(Confidential, Restricted));
+            assert!(!is_downgrade(Public, Restricted));
+        }
+
+        #[test]
+        fn downgrade_requires_notarization_matches_is_downgrade() {
+            use Classification::*;
+            for old in [Public, Standard, Confidential, Restricted] {
+                for new in [Public, Standard, Confidential, Restricted] {
+                    assert_eq!(
+                        downgrade_requires_notarization(old, new),
+                        is_downgrade(old, new),
+                        "{old:?} → {new:?}: predicate must track is_downgrade",
+                    );
+                }
             }
         }
     }

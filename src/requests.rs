@@ -77,6 +77,18 @@ pub struct CreateItemRequest {
     pub notarize_on_use: bool,
 }
 
+/// Reclassify an existing item. `acknowledge_grant_breakage = true` opts the
+/// caller into proceeding when the new classification would leave an active
+/// grant non-compliant under [`policy::classification::enforce_grant_policy`].
+/// Downgrades are always notarized regardless of this flag (issue #9 acceptance
+/// gap, #42).
+#[derive(Debug, Deserialize)]
+pub struct UpdateClassificationRequest {
+    pub classification: Classification,
+    #[serde(default)]
+    pub acknowledge_grant_breakage: bool,
+}
+
 // --- Grants ---
 
 #[derive(Debug, Deserialize)]
