@@ -40,6 +40,15 @@ pub struct Claims {
     pub read_only: Option<bool>,
     #[serde(default)]
     pub session_kind: SessionKind,
+    /// Per-log read whitelist. `None` = no constraint (session JWT or
+    /// full-access API key); `Some(vec)` = scoped API key may only read
+    /// these log IDs and their entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_log_read: Option<Vec<Uuid>>,
+    /// Per-log write whitelist. `None` = no constraint; `Some(vec)` =
+    /// scoped API key may only append to these log IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_log_write: Option<Vec<Uuid>>,
 }
 
 pub fn encode_jwt(
@@ -75,6 +84,8 @@ pub fn encode_jwt_full(
         api_key_id: None,
         read_only: None,
         session_kind: SessionKind::Full,
+        event_log_read: None,
+        event_log_write: None,
     };
 
     encode(
@@ -113,6 +124,8 @@ pub fn encode_jwt_limited(
         api_key_id: None,
         read_only: None,
         session_kind: SessionKind::Limited,
+        event_log_read: None,
+        event_log_write: None,
     };
 
     encode(
@@ -127,6 +140,23 @@ pub fn encode_jwt_api_key(
     email: &str,
     api_key_id: Uuid,
     read_only: bool,
+    secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    encode_jwt_api_key_full(user_id, email, api_key_id, read_only, None, None, secret)
+}
+
+/// Same as [`encode_jwt_api_key`] but lets the caller pin per-log read and
+/// write whitelists into the JWT. Either field set to `None` keeps the
+/// legacy "no constraint" behavior (back-compat for keys without the new
+/// scope); `Some(vec)` produces a scoped JWT.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_jwt_api_key_full(
+    user_id: Uuid,
+    email: &str,
+    api_key_id: Uuid,
+    read_only: bool,
+    event_log_read: Option<Vec<Uuid>>,
+    event_log_write: Option<Vec<Uuid>>,
     secret: &str,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = chrono::Utc::now();
@@ -146,6 +176,8 @@ pub fn encode_jwt_api_key(
         api_key_id: Some(api_key_id),
         read_only: Some(read_only),
         session_kind: SessionKind::Full,
+        event_log_read,
+        event_log_write,
     };
 
     encode(
@@ -183,6 +215,38 @@ pub fn decode_jwt_allow_expired(
 pub fn check_write_allowed(claims: &Claims) -> Result<(), ApiError> {
     if claims.read_only == Some(true) {
         return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+/// Check that the current session is allowed to append to the given event log.
+///
+/// Layered on top of [`check_write_allowed`]: the global `read_only` check
+/// runs first, then the per-log whitelist. `event_log_write = None` (session
+/// JWTs and unscoped API keys) imposes no per-log constraint — log ownership
+/// is checked at the route layer where the log row is loaded.
+pub fn check_event_log_write_allowed(claims: &Claims, log_id: Uuid) -> Result<(), ApiError> {
+    check_write_allowed(claims)?;
+    if let Some(allowed) = &claims.event_log_write {
+        if !allowed.contains(&log_id) {
+            return Err(ApiError::Forbidden);
+        }
+    }
+    Ok(())
+}
+
+/// Check that the current session is allowed to read the given event log
+/// (the log row, its entries, and inclusion proofs).
+///
+/// `event_log_read = None` (session JWTs and unscoped API keys) imposes no
+/// per-log constraint; the route layer enforces ownership against the log
+/// row's `user_id`. A scoped API key with `event_log_read = Some(vec)` may
+/// only see logs whose UUID is in the list.
+pub fn check_event_log_read_allowed(claims: &Claims, log_id: Uuid) -> Result<(), ApiError> {
+    if let Some(allowed) = &claims.event_log_read {
+        if !allowed.contains(&log_id) {
+            return Err(ApiError::Forbidden);
+        }
     }
     Ok(())
 }
@@ -267,6 +331,8 @@ mod tests {
             api_key_id: None,
             read_only: None,
             session_kind: SessionKind::Full,
+            event_log_read: None,
+            event_log_write: None,
         };
         let token = encode(
             &Header::default(),

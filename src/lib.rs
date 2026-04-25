@@ -11,6 +11,7 @@ pub mod envelope;
 pub mod error;
 #[cfg(feature = "server")]
 pub mod hashing;
+pub mod merkle;
 #[cfg(feature = "server")]
 pub mod network;
 pub mod padding;
