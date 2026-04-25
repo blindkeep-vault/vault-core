@@ -207,6 +207,23 @@ mod tests {
     }
 
     #[test]
+    fn leaf_hash_canonical_vector() {
+        // Cross-language consistency vector. The same (id, payload_hash,
+        // None, ts) tuple is hashed by vault-python's `leaf_hash` binding
+        // in `tests/test_blindkeep.py::test_leaf_hash_canonical_vector` and
+        // must match this byte-for-byte. If either side drifts, bindings
+        // consumers will compute leaves the server can't verify. Hex form:
+        // d43b11d71e24e03ec1a3b51716af7852a92888c7eb591ab92833bd07b3524620
+        let leaf = leaf_hash(id(), &[0xAB; 32], None, 1_700_000_000_000);
+        let expected: [u8; 32] = [
+            0xd4, 0x3b, 0x11, 0xd7, 0x1e, 0x24, 0xe0, 0x3e, 0xc1, 0xa3, 0xb5, 0x17, 0x16, 0xaf,
+            0x78, 0x52, 0xa9, 0x28, 0x88, 0xc7, 0xeb, 0x59, 0x1a, 0xb9, 0x28, 0x33, 0xbd, 0x07,
+            0xb3, 0x52, 0x46, 0x20,
+        ];
+        assert_eq!(leaf, expected);
+    }
+
+    #[test]
     fn node_hash_uses_domain_separator() {
         // Plain SHA-256(L || R) must NOT equal node_hash(L, R) — the leading
         // 0x01 is the second-preimage guard.
