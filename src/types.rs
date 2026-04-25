@@ -154,6 +154,13 @@ pub struct Grant {
     pub id: Uuid,
     pub item_id: Option<Uuid>,
     pub group_id: Option<Uuid>,
+    /// Event-log target (issue #94). Mutually exclusive with `item_id` and
+    /// `group_id`; the server enforces "exactly one of three" via the
+    /// `grants_target_xor` CHECK added in migration 046. Optional in the
+    /// struct so wire-format roundtrips of pre-#94 grants stay byte-identical
+    /// (the field is omitted on serialize when None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_log_id: Option<Uuid>,
     pub grantor_id: Uuid,
     pub grantee_email: String,
     pub grantee_id: Option<Uuid>,

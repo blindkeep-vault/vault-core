@@ -110,6 +110,14 @@ pub struct CreateGrantRequest {
     pub claim_ciphertext: Option<Vec<u8>>,
     pub group_id: Option<Uuid>,
     pub wrapped_item_keys: Option<serde_json::Value>,
+    /// Event-log target arm (issue #94). Mutually exclusive with `item_id`
+    /// and `group_id`; the route enforces "exactly one of three". Event
+    /// logs carry no encryption material of their own (entries are server-
+    /// signed plaintext), so callers send empty `wrapped_key` /
+    /// `ephemeral_pubkey` for this arm — same shape as link-secret item
+    /// grants today.
+    #[serde(default)]
+    pub event_log_id: Option<Uuid>,
     /// Cascade-revocation tag (issue #7). Independent from the grantee's
     /// own item scope: e.g. a contractor on scope `acme/pentest-q2` may be
     /// granted access to items outside that scope, but the grant itself
