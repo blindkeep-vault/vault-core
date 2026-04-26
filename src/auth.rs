@@ -49,6 +49,30 @@ pub struct Claims {
     /// scoped API key may only append to these log IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_log_write: Option<Vec<Uuid>>,
+    /// Active organization context for this session (issue #82). `None`
+    /// means the session is operating against the user's personal vault —
+    /// every pre-org-accounts JWT decodes with this defaulted to `None`,
+    /// preserving backward compatibility. When set, `ensure_access`
+    /// consults it alongside `org_role` to authorize org-owned resources.
+    /// The middleware re-validates membership on each request (plan task
+    /// 3.3) so a removed member's old token cannot ride forever on the
+    /// cached claim here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_org_id: Option<Uuid>,
+    /// Caller's role in `active_org_id` at issue time. Stored as the
+    /// canonical string form (`"owner"` / `"billing_admin"` / `"member"`)
+    /// matching `vault_core::types::OrgRole::as_str` and the
+    /// `org_members.role` CHECK constraint, so the JWT round-trips through
+    /// clients that don't know the typed enum.
+    ///
+    /// **Validation contract:** the field is typed as `String` (not
+    /// `OrgRole`) so a malformed payload still decodes — every server
+    /// consumer MUST parse via `OrgRole::from_str` at the point of use
+    /// and reject `Err`. The middleware also re-checks the live
+    /// `org_members` row on each request rather than trusting this
+    /// snapshot, so a stale role won't grant elevated access either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_role: Option<String>,
 }
 
 pub fn encode_jwt(
@@ -86,6 +110,8 @@ pub fn encode_jwt_full(
         session_kind: SessionKind::Full,
         event_log_read: None,
         event_log_write: None,
+        active_org_id: None,
+        org_role: None,
     };
 
     encode(
@@ -126,6 +152,63 @@ pub fn encode_jwt_limited(
         session_kind: SessionKind::Limited,
         event_log_read: None,
         event_log_write: None,
+        active_org_id: None,
+        org_role: None,
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+}
+
+/// Mint a Full session JWT carrying an `active_org_id` + `org_role`.
+///
+/// Used by `POST /auth/login` and `POST /auth/switch-org` to bind an org
+/// context to the session at issue time. `active_org_id = None` (and
+/// therefore `org_role = None`) yields a token byte-identical to one
+/// from [`encode_jwt`] for the same inputs — `skip_serializing_if`
+/// elides the org claims from the payload, which keeps wire-format
+/// parity with pre-org-accounts clients.
+///
+/// **Caller responsibility.** This helper does NOT consult `org_members`
+/// or `users.default_org_id`. The route layer must look up the caller's
+/// live role and pass it as `org_role`; minting a token with a role the
+/// user no longer holds would let the middleware re-validate-or-fail
+/// path catch the drift only on the *next* request, leaking elevated
+/// access for the duration of the issued JWT until that next call.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_jwt_with_org(
+    user_id: Uuid,
+    email: &str,
+    email_verified: bool,
+    needs_password_setup: bool,
+    active_org_id: Option<Uuid>,
+    org_role: Option<String>,
+    secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let now = chrono::Utc::now();
+    let exp = now
+        .checked_add_signed(chrono::Duration::hours(24))
+        .expect("valid timestamp")
+        .timestamp() as usize;
+    let iat = now.timestamp() as usize;
+
+    let claims = Claims {
+        sub: user_id,
+        email: email.to_owned(),
+        email_verified,
+        needs_password_setup,
+        exp,
+        iat,
+        api_key_id: None,
+        read_only: None,
+        session_kind: SessionKind::Full,
+        event_log_read: None,
+        event_log_write: None,
+        active_org_id,
+        org_role,
     };
 
     encode(
@@ -178,6 +261,12 @@ pub fn encode_jwt_api_key_full(
         session_kind: SessionKind::Full,
         event_log_read,
         event_log_write,
+        // API keys are strictly single-org per design D2 — the org
+        // context is baked at key-issue time, not per-request. Phase 6
+        // task 6.3 wires this when `api_keys.org_id` becomes load-bearing;
+        // for now every API key continues to operate as personal.
+        active_org_id: None,
+        org_role: None,
     };
 
     encode(
@@ -333,6 +422,8 @@ mod tests {
             session_kind: SessionKind::Full,
             event_log_read: None,
             event_log_write: None,
+            active_org_id: None,
+            org_role: None,
         };
         let token = encode(
             &Header::default(),
@@ -481,5 +572,123 @@ mod tests {
         .unwrap();
         let claims = decode_jwt_allow_expired(&token, TEST_SECRET).unwrap();
         assert!(check_write_allowed(&claims).is_ok());
+    }
+
+    #[test]
+    fn pre_org_jwt_decodes_with_no_org_context() {
+        // Forward-compat: any JWT issued before the org-accounts claims
+        // existed (i.e. without `active_org_id` / `org_role` in the payload)
+        // must decode with both defaulted to `None`. Build a payload that
+        // omits the new fields entirely and confirm.
+        use serde_json::json;
+        let payload = json!({
+            "sub": test_user_id().to_string(),
+            "email": "user@example.com",
+            "email_verified": true,
+            "exp": (chrono::Utc::now().timestamp() as usize) + 3600,
+        });
+        let claims: Claims = serde_json::from_value(payload).unwrap();
+        assert!(claims.active_org_id.is_none());
+        assert!(claims.org_role.is_none());
+    }
+
+    #[test]
+    fn regular_jwt_omits_org_context_on_wire() {
+        // `skip_serializing_if = "Option::is_none"` keeps the JWT payload
+        // byte-identical to pre-org-accounts for sessions without an
+        // active org. Important for diff-noise-free upgrades and for any
+        // client that compares payloads against a recorded snapshot.
+        let token = encode_jwt(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let pad = (4 - payload_b64.len() % 4) % 4;
+        let mut padded = payload_b64.to_string();
+        padded.extend(std::iter::repeat('=').take(pad));
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE,
+            padded.as_bytes(),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            payload.get("active_org_id").is_none(),
+            "active_org_id must be omitted when None"
+        );
+        assert!(
+            payload.get("org_role").is_none(),
+            "org_role must be omitted when None"
+        );
+    }
+
+    #[test]
+    fn encode_jwt_with_org_roundtrips() {
+        let uid = test_user_id();
+        let org_id = Uuid::parse_str("770e8400-e29b-41d4-a716-446655440000").unwrap();
+        let token = encode_jwt_with_org(
+            uid,
+            "user@example.com",
+            true,
+            false,
+            Some(org_id),
+            Some("billing_admin".to_string()),
+            TEST_SECRET,
+        )
+        .unwrap();
+        let claims = decode_jwt_allow_expired(&token, TEST_SECRET).unwrap();
+
+        assert_eq!(claims.sub, uid);
+        assert_eq!(claims.active_org_id, Some(org_id));
+        assert_eq!(claims.org_role.as_deref(), Some("billing_admin"));
+        assert_eq!(claims.session_kind, SessionKind::Full);
+        assert!(claims.email_verified);
+    }
+
+    #[test]
+    fn encode_jwt_with_org_none_omits_fields_on_wire() {
+        // When the caller passes None/None we must produce a payload that
+        // does NOT carry active_org_id / org_role — that's how a personal
+        // session stays wire-compatible with pre-org-accounts clients.
+        let token = encode_jwt_with_org(
+            test_user_id(),
+            "user@example.com",
+            true,
+            false,
+            None,
+            None,
+            TEST_SECRET,
+        )
+        .unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let pad = (4 - payload_b64.len() % 4) % 4;
+        let mut padded = payload_b64.to_string();
+        padded.extend(std::iter::repeat('=').take(pad));
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE,
+            padded.as_bytes(),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.get("active_org_id").is_none());
+        assert!(payload.get("org_role").is_none());
+    }
+
+    #[test]
+    fn org_context_roundtrips_through_payload() {
+        // Direct payload construction with the new fields populated:
+        // ensures decode honors them, since no encode helper takes org
+        // context as a parameter yet (Phase 3's `/auth/switch-org` route
+        // is what will mint these claims in production).
+        use serde_json::json;
+        let org_id = Uuid::parse_str("770e8400-e29b-41d4-a716-446655440000").unwrap();
+        let payload = json!({
+            "sub": test_user_id().to_string(),
+            "email": "user@example.com",
+            "email_verified": true,
+            "exp": (chrono::Utc::now().timestamp() as usize) + 3600,
+            "active_org_id": org_id.to_string(),
+            "org_role": "billing_admin",
+        });
+        let claims: Claims = serde_json::from_value(payload).unwrap();
+        assert_eq!(claims.active_org_id, Some(org_id));
+        assert_eq!(claims.org_role.as_deref(), Some("billing_admin"));
     }
 }

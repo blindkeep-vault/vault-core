@@ -111,10 +111,16 @@ fn write_canonical(v: &serde_json::Value, out: &mut String) -> Result<(), Canoni
 /// entry id, …). `blob_hash = None` substitutes 32 zero bytes — the hash
 /// that `Some(&[0u8; 32])` would produce, so callers can interchangeably
 /// pass either form.
+///
+/// Hash inputs are typed as `&[u8; 32]` to make a length-confusion footgun
+/// unrepresentable: a 31-byte content_hash + 33-byte blob_hash would otherwise
+/// hash identically to a 32+32 caller. The wire format is unchanged for any
+/// 32-byte input — this is a type-system tightening only. See `doc/SPEC.md`
+/// §"Append-only Event Logs" for the leaf-preimage contract.
 pub fn leaf_hash(
     id: Uuid,
-    content_hash: &[u8],
-    blob_hash: Option<&[u8]>,
+    content_hash: &[u8; 32],
+    blob_hash: Option<&[u8; 32]>,
     timestamp_millis: i64,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();

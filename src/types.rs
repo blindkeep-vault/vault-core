@@ -213,6 +213,117 @@ pub struct AuditEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// Organization role within an `org_members` row.
+///
+/// `Owner` may invite, remove members, change roles, and close the org.
+/// `BillingAdmin` may manage payment / topup but cannot manage membership
+/// or vault content. `Member` has resource access only (no billing). The
+/// authorization rule that combines a caller's role with a required role
+/// is [`OrgRole::satisfies`].
+///
+/// Snake-case wire format matches the `org_members.role` CHECK constraint
+/// in migration 041 — `role` is bound directly via [`Self::as_str`] and
+/// parsed back via [`std::str::FromStr`] at the db layer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgRole {
+    Owner,
+    BillingAdmin,
+    Member,
+}
+
+impl OrgRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            OrgRole::Owner => "owner",
+            OrgRole::BillingAdmin => "billing_admin",
+            OrgRole::Member => "member",
+        }
+    }
+
+    /// Authorization check: does the caller's role (`self`) authorize an
+    /// action that requires `required`?
+    ///
+    /// `Owner` is a superset of both other roles and satisfies anything.
+    /// `BillingAdmin` and `Member` are parallel responsibilities (billing
+    /// vs. resource access — see the type-level doc for the split) and do
+    /// not cross-elevate: `BillingAdmin` does NOT satisfy `Member`, and
+    /// vice versa. This preserves separation of duties — `BillingAdmin`
+    /// exists precisely so a finance-only seat can't read vault content;
+    /// folding it into `Member` would defeat the role.
+    ///
+    /// "Any role passes" is expressed at the call site by skipping the
+    /// `satisfies` check (e.g. `Option::None` in the resource-authz
+    /// helper), not by passing a distinguished value here.
+    pub const fn satisfies(self, required: OrgRole) -> bool {
+        matches!(
+            (self, required),
+            (OrgRole::Owner, _)
+                | (OrgRole::BillingAdmin, OrgRole::BillingAdmin)
+                | (OrgRole::Member, OrgRole::Member)
+        )
+    }
+}
+
+impl std::str::FromStr for OrgRole {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "owner" => Ok(Self::Owner),
+            "billing_admin" => Ok(Self::BillingAdmin),
+            "member" => Ok(Self::Member),
+            _ => Err("unknown org role"),
+        }
+    }
+}
+
+/// Public-facing organization record (issue #82). Server-internal billing
+/// fields (`mbhour_balance`, grace timestamps, …) live on the corresponding
+/// `OrganizationRow` in `vault-api/src/db/orgs.rs` — the wire shape stays
+/// minimal so a member listing doesn't expose another tenant's burn rate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Organization {
+    pub id: Uuid,
+    pub name: String,
+    pub billing_email: String,
+    pub stripe_customer_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrgMember {
+    pub org_id: Uuid,
+    pub user_id: Uuid,
+    pub role: OrgRole,
+    pub joined_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrgInvitation {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub invited_email: String,
+    pub role: OrgRole,
+    /// SHA-256 hex of the secret token. Server-internal: the hash is the
+    /// DB-side handle for an invite (`get_invitation_by_token_hash`) and
+    /// must never be serialized into a wire shape — anyone who later
+    /// learns a plaintext token (forwarded email, support ticket, etc.)
+    /// could otherwise re-derive the hash and confirm which invite it
+    /// belonged to without the original holder's cooperation. The
+    /// plaintext token is returned exactly once at creation time via
+    /// `CreateInvitationResponse::token` (route layer); after that no
+    /// API surface should expose either form.
+    #[serde(skip)]
+    pub token_hash: String,
+    pub expires_at: DateTime<Utc>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +656,147 @@ mod tests {
         let parsed: Group = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, group.id);
         assert_eq!(parsed.wrapped_key, group.wrapped_key);
+    }
+
+    #[test]
+    fn org_role_serde_roundtrip() {
+        for variant in [OrgRole::Owner, OrgRole::BillingAdmin, OrgRole::Member] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let parsed: OrgRole = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn org_role_snake_case_serialization() {
+        assert_eq!(serde_json::to_string(&OrgRole::Owner).unwrap(), "\"owner\"");
+        assert_eq!(
+            serde_json::to_string(&OrgRole::BillingAdmin).unwrap(),
+            "\"billing_admin\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OrgRole::Member).unwrap(),
+            "\"member\""
+        );
+    }
+
+    #[test]
+    fn org_role_as_str_matches_serde() {
+        // Drift guard: the `org_members.role` CHECK constraint accepts the
+        // exact set returned by `as_str()`. If the serde rename and the
+        // helper diverge, the db layer would write a value the CHECK
+        // rejects (or vice versa).
+        for variant in [OrgRole::Owner, OrgRole::BillingAdmin, OrgRole::Member] {
+            let serde_form = serde_json::to_string(&variant).unwrap();
+            let quoted = format!("\"{}\"", variant.as_str());
+            assert_eq!(serde_form, quoted, "variant {variant:?} drifted");
+        }
+    }
+
+    #[test]
+    fn org_role_from_str_roundtrips() {
+        use std::str::FromStr;
+        for variant in [OrgRole::Owner, OrgRole::BillingAdmin, OrgRole::Member] {
+            let parsed = OrgRole::from_str(variant.as_str()).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn org_role_from_str_rejects_unknown() {
+        use std::str::FromStr;
+        assert!(OrgRole::from_str("admin").is_err());
+        assert!(OrgRole::from_str("Owner").is_err()); // case-sensitive
+        assert!(OrgRole::from_str("").is_err());
+    }
+
+    #[test]
+    fn org_role_satisfies_full_matrix() {
+        // Caller × required matrix. Owner is a superset; BillingAdmin and
+        // Member are parallel and do NOT cross-elevate (separation of
+        // duties — see the docstring).
+        let cases: &[(OrgRole, OrgRole, bool)] = &[
+            (OrgRole::Owner, OrgRole::Owner, true),
+            (OrgRole::Owner, OrgRole::BillingAdmin, true),
+            (OrgRole::Owner, OrgRole::Member, true),
+            (OrgRole::BillingAdmin, OrgRole::Owner, false),
+            (OrgRole::BillingAdmin, OrgRole::BillingAdmin, true),
+            (OrgRole::BillingAdmin, OrgRole::Member, false),
+            (OrgRole::Member, OrgRole::Owner, false),
+            (OrgRole::Member, OrgRole::BillingAdmin, false),
+            (OrgRole::Member, OrgRole::Member, true),
+        ];
+        for (caller, required, expected) in cases.iter().copied() {
+            assert_eq!(
+                caller.satisfies(required),
+                expected,
+                "satisfies({caller:?}, {required:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn organization_serde_roundtrip() {
+        let org = Organization {
+            id: Uuid::new_v4(),
+            name: "Acme Inc.".to_string(),
+            billing_email: "billing@acme.example".to_string(),
+            stripe_customer_id: Some("cus_test123".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            closed_at: None,
+        };
+        let json = serde_json::to_string(&org).unwrap();
+        let parsed: Organization = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, org);
+    }
+
+    #[test]
+    fn org_member_serde_roundtrip() {
+        let member = OrgMember {
+            org_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            role: OrgRole::Owner,
+            joined_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&member).unwrap();
+        let parsed: OrgMember = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, member);
+    }
+
+    #[test]
+    fn org_invitation_serde_roundtrip_drops_token_hash() {
+        let invite = OrgInvitation {
+            id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            invited_email: "alice@example.com".to_string(),
+            role: OrgRole::Member,
+            token_hash: "deadbeef".to_string(),
+            expires_at: Utc::now(),
+            accepted_at: None,
+            revoked_at: None,
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&invite).unwrap();
+
+        // `token_hash` is server-internal — it must NOT appear in any
+        // serialized form, even alongside the plaintext token at create
+        // time. A consumer who learns the token later must not be able
+        // to recover the hash from a stored response payload.
+        assert!(!json.contains("token_hash"));
+        assert!(!json.contains("deadbeef"));
+
+        // Every other field round-trips; token_hash deserializes to its
+        // String default ("") because of #[serde(skip)].
+        let parsed: OrgInvitation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, invite.id);
+        assert_eq!(parsed.org_id, invite.org_id);
+        assert_eq!(parsed.invited_email, invite.invited_email);
+        assert_eq!(parsed.role, invite.role);
+        assert_eq!(parsed.expires_at, invite.expires_at);
+        assert_eq!(parsed.accepted_at, invite.accepted_at);
+        assert_eq!(parsed.revoked_at, invite.revoked_at);
+        assert_eq!(parsed.created_at, invite.created_at);
+        assert_eq!(parsed.token_hash, "");
     }
 }
