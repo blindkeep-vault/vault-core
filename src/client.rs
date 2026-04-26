@@ -433,7 +433,7 @@ pub fn prepare_registration(password: &str) -> Result<RegistrationPayload, Clien
     let enc_key = crypto::derive_subkey(&master_key, b"vault-enc")?;
 
     let (privkey, pubkey) = crypto::generate_x25519_keypair();
-    let enc_privkey = crypto::encrypt_item_v1(&enc_key, &privkey, b"privkey")?;
+    let enc_privkey = crypto::encrypt_item_v1(&enc_key, &*privkey, b"privkey")?;
 
     let mut encrypted_private_key = Vec::with_capacity(NONCE_LEN + enc_privkey.ciphertext.len());
     encrypted_private_key.extend_from_slice(&enc_privkey.nonce);
@@ -483,7 +483,7 @@ pub fn prepare_api_key_scoped() -> Result<PreparedApiKeyScoped, ClientError> {
     let (wrapping_key, auth_key) = crypto::derive_api_key_keys(&secret)?;
 
     let (privkey, pubkey) = crypto::generate_x25519_keypair();
-    let wrapped_privkey = crypto::wrap_master_key(&wrapping_key, &MasterKey::from_bytes(privkey))?;
+    let wrapped_privkey = crypto::wrap_master_key(&wrapping_key, &MasterKey::from_bytes(*privkey))?;
 
     Ok(PreparedApiKeyScoped {
         secret,
@@ -891,7 +891,7 @@ pub fn decrypt_link_grant(
     if item_key_plain.len() != 32 {
         return Err(ClientError::InvalidKeyLength);
     }
-    let mut item_key = [0u8; 32];
+    let mut item_key = Zeroizing::new([0u8; 32]);
     item_key.copy_from_slice(&item_key_plain);
 
     let decrypted = crate::envelope::decrypt_blob_bytes(blob_data, &item_key, grantor_id)?;
@@ -919,19 +919,20 @@ pub fn decrypt_link_grant(
 
 /// Unwrap a link-secret grant's item key without decrypting the blob.
 ///
-/// Returns the raw 32-byte item key recovered from the claim_key flow.
+/// Returns the raw 32-byte item key recovered from the claim_key flow,
+/// wrapped in `Zeroizing` so it wipes on drop.
 pub fn unwrap_link_grant_key(
     claim_key: &[u8; 32],
     claim_ciphertext: &[u8],
     wrapped_key: &[u8],
     nonce: &[u8],
-) -> Result<[u8; 32], ClientError> {
+) -> Result<Zeroizing<[u8; 32]>, ClientError> {
     let link_secret = crypto::decrypt_claim_secret(claim_key, claim_ciphertext)?;
     let item_key_plain = crypto::decrypt_item_auto(&link_secret, wrapped_key, nonce, b"")?;
     if item_key_plain.len() != 32 {
         return Err(ClientError::InvalidKeyLength);
     }
-    let mut item_key = [0u8; 32];
+    let mut item_key = Zeroizing::new([0u8; 32]);
     item_key.copy_from_slice(&item_key_plain);
     Ok(item_key)
 }
@@ -1250,7 +1251,7 @@ mod tests {
             &lg.nonce,
         )
         .unwrap();
-        assert_eq!(recovered, item_key);
+        assert_eq!(*recovered, item_key);
 
         // Unwrap file key from link_secret (nonce(24) || V1 ciphertext)
         let file_wrapped = lg.file_wrapped_key.unwrap();
@@ -1272,7 +1273,7 @@ mod tests {
             &lg.nonce,
         )
         .unwrap();
-        assert_eq!(recovered, item_key);
+        assert_eq!(*recovered, item_key);
     }
 
     #[cfg(feature = "drops")]

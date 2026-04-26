@@ -382,7 +382,7 @@ pub fn unwrap_key_v1(
     wrapped_key: &[u8],
     nonce: &[u8],
     recipient_public_key: &[u8; PUBKEY_LEN],
-) -> Result<[u8; KEY_LEN], CryptoError> {
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
     use x25519_dalek::{PublicKey, StaticSecret};
@@ -410,7 +410,7 @@ pub fn unwrap_key_v1(
         return Err(CryptoError::InvalidKeyLength);
     }
 
-    let mut key = [0u8; KEY_LEN];
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
     key.copy_from_slice(&plaintext);
     Ok(key)
 }
@@ -436,7 +436,7 @@ pub fn unwrap_grant_key(
     ephemeral_pubkey: &[u8; PUBKEY_LEN],
     grant_wrapped_key: &[u8],
     recipient_public_key: &[u8; PUBKEY_LEN],
-) -> Result<[u8; KEY_LEN], CryptoError> {
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
     if grant_wrapped_key.len() < NONCE_LEN + 1 {
         return Err(CryptoError::DecryptionFailed);
     }
@@ -474,12 +474,13 @@ pub fn decrypt_private_key(
 }
 
 /// Generate a random X25519 keypair.
-/// Returns (private_key, public_key) both as 32-byte arrays.
-pub fn generate_x25519_keypair() -> ([u8; KEY_LEN], [u8; PUBKEY_LEN]) {
+/// Returns (private_key, public_key). Private key is wrapped in `Zeroizing`
+/// so it wipes on drop; public key is not sensitive.
+pub fn generate_x25519_keypair() -> (Zeroizing<[u8; KEY_LEN]>, [u8; PUBKEY_LEN]) {
     use x25519_dalek::{PublicKey, StaticSecret};
     let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let public = PublicKey::from(&secret);
-    (secret.to_bytes(), *public.as_bytes())
+    (Zeroizing::new(secret.to_bytes()), *public.as_bytes())
 }
 
 /// Derive a wrapping key and auth key from an API key secret using HKDF-SHA256.
@@ -597,7 +598,7 @@ pub fn encrypt_claim_secret(
 pub fn decrypt_claim_secret(
     claim_key: &[u8; 32],
     claim_ciphertext: &[u8],
-) -> Result<[u8; 32], CryptoError> {
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 
     if claim_ciphertext.len() < 12 {
@@ -607,13 +608,15 @@ pub fn decrypt_claim_secret(
     let ct = &claim_ciphertext[12..];
     let cipher = Aes256Gcm::new(claim_key.into());
     let nonce = Nonce::from_slice(iv);
-    let plaintext = cipher
-        .decrypt(nonce, ct)
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(nonce, ct)
+            .map_err(|_| CryptoError::DecryptionFailed)?,
+    );
     if plaintext.len() != 32 {
         return Err(CryptoError::DecryptionFailed);
     }
-    let mut result = [0u8; 32];
+    let mut result = Zeroizing::new([0u8; 32]);
     result.copy_from_slice(&plaintext);
     Ok(result)
 }
@@ -729,7 +732,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(unwrapped, item_key);
+        assert_eq!(*unwrapped, item_key);
     }
 
     #[test]
@@ -1034,12 +1037,51 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(unwrapped, item_key);
+        assert_eq!(*unwrapped, item_key);
     }
 
     #[test]
     fn unwrap_grant_key_truncated_fails() {
         assert!(unwrap_grant_key(&[0u8; 32], &[0u8; 32], &[0u8; 10], &[0u8; 32]).is_err());
+    }
+
+    // Regression: keep these returning Zeroizing<[u8; KEY_LEN]> so item keys
+    // wipe on drop. A future "simplification" that strips the wrapper trips
+    // this test at compile time.
+    #[test]
+    fn unwrap_returns_zeroizing() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let item_key = [1u8; 32];
+        let recipient_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let recipient_public = PublicKey::from(&recipient_secret);
+
+        let v1 = wrap_key_for_recipient_v1(&item_key, recipient_public.as_bytes()).unwrap();
+        let _: Zeroizing<[u8; KEY_LEN]> = unwrap_key_v1(
+            &recipient_secret.to_bytes(),
+            &v1.ephemeral_pubkey,
+            &v1.wrapped_key,
+            &v1.nonce,
+            recipient_public.as_bytes(),
+        )
+        .unwrap();
+
+        let (gwk, eph) = wrap_key_for_grant(&item_key, recipient_public.as_bytes()).unwrap();
+        let _: Zeroizing<[u8; KEY_LEN]> = unwrap_grant_key(
+            &recipient_secret.to_bytes(),
+            &eph,
+            &gwk,
+            recipient_public.as_bytes(),
+        )
+        .unwrap();
+    }
+
+    // Regression: generate_x25519_keypair must keep its private-key half
+    // wrapped in Zeroizing.
+    #[test]
+    fn generate_x25519_keypair_returns_zeroizing_privkey() {
+        let (_privkey, _pubkey): (Zeroizing<[u8; KEY_LEN]>, [u8; PUBKEY_LEN]) =
+            generate_x25519_keypair();
     }
 
     #[test]
@@ -1083,7 +1125,7 @@ mod tests {
         let encrypted = encrypt_claim_secret(&claim_key, &link_secret).unwrap();
         assert_eq!(encrypted.len(), 12 + 32 + 16); // iv + plaintext + tag
         let decrypted = decrypt_claim_secret(&claim_key, &encrypted).unwrap();
-        assert_eq!(decrypted, link_secret);
+        assert_eq!(*decrypted, link_secret);
     }
 
     #[test]
