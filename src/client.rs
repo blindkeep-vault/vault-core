@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{self, CryptoError, MasterKey, CIPHERTEXT_V1, KEY_LEN, NONCE_LEN};
 use crate::envelope::SecretBlob;
-use crate::padding;
+use crate::padding::{self, PadError};
 
 /// Errors from client orchestration functions.
 #[derive(Debug, thiserror::Error)]
@@ -19,6 +19,8 @@ pub enum ClientError {
     Crypto(#[from] CryptoError),
     #[error("serialization: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("padding: {0}")]
+    Padding(#[from] PadError),
     #[error("base64 decode failed")]
     Base64Decode,
     #[error("invalid key length")]
@@ -90,7 +92,7 @@ pub struct LoginPayload {
 #[derive(Debug)]
 pub struct PreparedApiKeyFull {
     /// Random 32-byte secret.
-    pub secret: [u8; 32],
+    pub secret: Zeroizing<[u8; 32]>,
     /// Key prefix, e.g. `vk_abcd1234`.
     pub key_prefix: String,
     /// Hex-encoded auth key for the server.
@@ -103,7 +105,7 @@ pub struct PreparedApiKeyFull {
 #[derive(Debug)]
 pub struct PreparedApiKeyScoped {
     /// Random 32-byte secret.
-    pub secret: [u8; 32],
+    pub secret: Zeroizing<[u8; 32]>,
     /// Key prefix, e.g. `vk_abcd1234`.
     pub key_prefix: String,
     /// Hex-encoded auth key for the server.
@@ -118,7 +120,7 @@ pub struct PreparedApiKeyScoped {
 #[derive(Debug, Clone)]
 pub struct WillItemKey {
     pub item_id: String,
-    pub item_key: [u8; 32],
+    pub item_key: Zeroizing<[u8; 32]>,
 }
 
 /// Result of [`prepare_will_payload`].
@@ -175,9 +177,9 @@ fn encrypt_blob_v1(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u
     Ok(blob)
 }
 
-fn random_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+fn random_key() -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut *key);
     key
 }
 
@@ -187,12 +189,12 @@ fn unwrap_item_key(
     wrapped_key: &[u8],
     nonce: &[u8],
     wrap_aad: &[u8],
-) -> Result<[u8; 32], ClientError> {
+) -> Result<Zeroizing<[u8; 32]>, ClientError> {
     let plain = crypto::decrypt_item_auto(enc_key, wrapped_key, nonce, wrap_aad)?;
     if plain.len() != 32 {
         return Err(ClientError::InvalidKeyLength);
     }
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&plain);
     Ok(key)
 }
@@ -234,7 +236,7 @@ pub fn prepare_item_create(
 
     let enc_key = crypto::derive_subkey(master_key, b"vault-enc")?;
     let w_aad = wrap_aad(user_id);
-    let wrapped = crypto::encrypt_item_v1(&enc_key, &item_key, &w_aad)?;
+    let wrapped = crypto::encrypt_item_v1(&enc_key, &*item_key, &w_aad)?;
 
     Ok(PreparedItem {
         encrypted_blob_b64: blob_b64,
@@ -259,8 +261,12 @@ pub fn decrypt_owned_item(
     let item_key = unwrap_item_key(&enc_key, wrapped_key, nonce, &w_aad)?;
 
     let decrypted = crate::envelope::decrypt_blob_bytes(blob_data, &item_key, user_id)?;
-    let decrypted = crate::padding::unpad(&decrypted);
-    let blob: SecretBlob = serde_json::from_slice(decrypted)?;
+    // Legacy V0 owned items were stored as raw JSON without the 4-byte
+    // length prefix; fall through to raw bytes on unpad failure to keep
+    // them readable. New V1 items always pad; tampered V1 prefix → JSON
+    // parse error returned to caller (#129 L-1, residual).
+    let unpadded = crate::padding::unpad(&decrypted).unwrap_or(&decrypted[..]);
+    let blob: SecretBlob = serde_json::from_slice(unpadded)?;
     Ok(blob)
 }
 
@@ -291,7 +297,7 @@ pub fn unwrap_owned_item_key(
     user_id: &str,
     wrapped_key: &[u8],
     nonce: &[u8],
-) -> Result<[u8; 32], ClientError> {
+) -> Result<Zeroizing<[u8; 32]>, ClientError> {
     let enc_key = crypto::derive_subkey(master_key, b"vault-enc")?;
     let w_aad = wrap_aad(user_id);
     unwrap_item_key(&enc_key, wrapped_key, nonce, &w_aad)
@@ -382,7 +388,7 @@ pub fn prepare_file_item(
     let encrypted_file = encrypt_blob_v1(&file_key, &padded_file, &blob_aad)?;
 
     // Wrap file key (stored inside the envelope)
-    let file_wrapped = crypto::encrypt_item_v1(&enc_key, &file_key, &w_aad)?;
+    let file_wrapped = crypto::encrypt_item_v1(&enc_key, &*file_key, &w_aad)?;
 
     // Build metadata envelope
     let envelope = SecretBlob {
@@ -406,7 +412,7 @@ pub fn prepare_file_item(
     let envelope_b64 = STANDARD.encode(&envelope_data);
 
     // Wrap envelope key
-    let wrapped = crypto::encrypt_item_v1(&enc_key, &envelope_key, &w_aad)?;
+    let wrapped = crypto::encrypt_item_v1(&enc_key, &*envelope_key, &w_aad)?;
 
     Ok(PreparedFileItem {
         envelope_b64,
@@ -470,8 +476,8 @@ pub fn prepare_api_key_full(master_key: &MasterKey) -> Result<PreparedApiKeyFull
     let wrapped_master_key = crypto::wrap_master_key(&wrapping_key, master_key)?;
 
     Ok(PreparedApiKeyFull {
-        secret,
         key_prefix: format!("vk_{}", hex::encode(&secret[..4])),
+        secret,
         auth_key_hex: hex::encode(&*auth_key),
         wrapped_master_key,
     })
@@ -486,8 +492,8 @@ pub fn prepare_api_key_scoped() -> Result<PreparedApiKeyScoped, ClientError> {
     let wrapped_privkey = crypto::wrap_master_key(&wrapping_key, &MasterKey::from_bytes(*privkey))?;
 
     Ok(PreparedApiKeyScoped {
-        secret,
         key_prefix: format!("vk_{}", hex::encode(&secret[..4])),
+        secret,
         auth_key_hex: hex::encode(&*auth_key),
         encrypted_private_key: wrapped_privkey,
         public_key: pubkey,
@@ -515,7 +521,7 @@ pub fn encrypt_group(
     let blob_b64 = STANDARD.encode(&blob_data);
 
     let enc_key = crypto::derive_subkey(master_key, b"vault-enc")?;
-    let wrapped = crypto::encrypt_item_v1(&enc_key, &group_key, &w_aad)?;
+    let wrapped = crypto::encrypt_item_v1(&enc_key, &*group_key, &w_aad)?;
 
     Ok((blob_b64, wrapped.ciphertext, wrapped.nonce))
 }
@@ -574,7 +580,7 @@ pub fn prepare_will_payload(
 
     let mut wrapped_items = serde_json::Map::new();
     for item in items {
-        let enc = crypto::encrypt_item_v1(&will_key, &item.item_key, &w_aad)?;
+        let enc = crypto::encrypt_item_v1(&will_key, &*item.item_key, &w_aad)?;
         // Store as base64(nonce || ciphertext) for each item
         let mut buf = Vec::with_capacity(NONCE_LEN + enc.ciphertext.len());
         buf.extend_from_slice(&enc.nonce);
@@ -717,7 +723,7 @@ pub fn prepare_will_payload_mnemonic(
 
     let mut wrapped_items = serde_json::Map::new();
     for item in items {
-        let enc = crypto::encrypt_item_v1(&will_key, &item.item_key, &w_aad)?;
+        let enc = crypto::encrypt_item_v1(&will_key, &*item.item_key, &w_aad)?;
         let mut buf = Vec::with_capacity(NONCE_LEN + enc.ciphertext.len());
         buf.extend_from_slice(&enc.nonce);
         buf.extend_from_slice(&enc.ciphertext);
@@ -733,7 +739,7 @@ pub fn prepare_will_payload_mnemonic(
     let lookup_key = crate::drops::derive_drop_lookup_key(&mnemonic);
 
     // Wrap will key with mnemonic-derived wrapping key (V1)
-    let enc = crypto::encrypt_item_v1(&wrapping_key, &will_key, b"will-wrap")?;
+    let enc = crypto::encrypt_item_v1(&wrapping_key, &*will_key, b"will-wrap")?;
     let mut encrypted_will_key = Vec::with_capacity(NONCE_LEN + enc.ciphertext.len());
     encrypted_will_key.extend_from_slice(&enc.nonce);
     encrypted_will_key.extend_from_slice(&enc.ciphertext);
@@ -839,8 +845,8 @@ pub fn prepare_link_grant(
 ) -> Result<PreparedLinkGrant, ClientError> {
     use sha2::{Digest, Sha256};
 
-    let link_secret = Zeroizing::new(random_key());
-    let claim_key = Zeroizing::new(random_key());
+    let link_secret = random_key();
+    let claim_key = random_key();
 
     // Wrap item_key with link_secret (V1, empty AAD for cross-platform compat)
     let ls_wrapped = crypto::encrypt_item_v1(&link_secret, item_key, b"")?;
@@ -895,7 +901,12 @@ pub fn decrypt_link_grant(
     item_key.copy_from_slice(&item_key_plain);
 
     let decrypted = crate::envelope::decrypt_blob_bytes(blob_data, &item_key, grantor_id)?;
-    let unpadded = crate::padding::unpad(&decrypted);
+    // Lenient unpad: legacy V0 link-grant payloads were stored without the
+    // 4-byte length prefix (raw plaintext as the JSON or text body). Falling
+    // back to the raw bytes preserves decryption of those archived grants.
+    // New V1 grants always pad, so a tampered V1 prefix would slip through
+    // here as raw garbage — accepted residual risk; tracked by #129 L-1.
+    let unpadded = crate::padding::unpad(&decrypted).unwrap_or(&decrypted[..]);
 
     match serde_json::from_slice::<SecretBlob>(unpadded) {
         Ok(blob) => Ok(blob),
@@ -1046,7 +1057,7 @@ mod tests {
         let decrypted =
             crate::envelope::decrypt_blob_bytes(&prepared.encrypted_file, &file_key, user_id)
                 .unwrap();
-        let unpadded = padding::unpad(&decrypted);
+        let unpadded = padding::unpad(&decrypted).expect("file blob is V1-padded");
         assert_eq!(unpadded, file_data);
     }
 
@@ -1117,11 +1128,11 @@ mod tests {
         let items = vec![
             WillItemKey {
                 item_id: "item-1".into(),
-                item_key: [1u8; 32],
+                item_key: Zeroizing::new([1u8; 32]),
             },
             WillItemKey {
                 item_id: "item-2".into(),
-                item_key: [2u8; 32],
+                item_key: Zeroizing::new([2u8; 32]),
             },
         ];
 
@@ -1148,7 +1159,7 @@ mod tests {
             let ciphertext = &wrapped_bytes[NONCE_LEN..];
             let decrypted =
                 crypto::decrypt_item_auto(&will_key, ciphertext, nonce, &w_aad).unwrap();
-            assert_eq!(&*decrypted, &item.item_key);
+            assert_eq!(&*decrypted, &*item.item_key);
         }
     }
 
@@ -1168,7 +1179,7 @@ mod tests {
         let wrapped = wrap_key_for_user(&mk, user_id, &raw_key).unwrap();
         let unwrapped =
             unwrap_owned_item_key(&mk, user_id, &wrapped.wrapped_key, &wrapped.nonce).unwrap();
-        assert_eq!(unwrapped, raw_key);
+        assert_eq!(*unwrapped, raw_key);
     }
 
     #[test]
@@ -1283,11 +1294,11 @@ mod tests {
         let items = vec![
             WillItemKey {
                 item_id: "item-a".into(),
-                item_key: [10u8; 32],
+                item_key: Zeroizing::new([10u8; 32]),
             },
             WillItemKey {
                 item_id: "item-b".into(),
-                item_key: [20u8; 32],
+                item_key: Zeroizing::new([20u8; 32]),
             },
         ];
 
@@ -1316,7 +1327,26 @@ mod tests {
             let ciphertext = &wrapped_bytes[NONCE_LEN..];
             let decrypted =
                 crypto::decrypt_item_auto(&will_key, ciphertext, nonce, &w_aad).unwrap();
-            assert_eq!(&*decrypted, &item.item_key);
+            assert_eq!(&*decrypted, &*item.item_key);
         }
+    }
+
+    // Regression: keep the secret-bearing fields wrapped in Zeroizing so the
+    // bytes wipe on drop. A future "simplification" that strips the wrapper
+    // trips this test at compile time.
+    #[test]
+    fn sensitive_struct_fields_are_zeroizing() {
+        let mk = test_master_key();
+        let full = prepare_api_key_full(&mk).unwrap();
+        let _: Zeroizing<[u8; 32]> = full.secret;
+
+        let scoped = prepare_api_key_scoped().unwrap();
+        let _: Zeroizing<[u8; 32]> = scoped.secret;
+
+        let item = WillItemKey {
+            item_id: "x".into(),
+            item_key: Zeroizing::new([0u8; 32]),
+        };
+        let _: Zeroizing<[u8; 32]> = item.item_key;
     }
 }

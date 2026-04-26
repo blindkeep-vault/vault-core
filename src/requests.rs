@@ -237,7 +237,11 @@ pub struct ApiKeyAuthResponse {
     pub api_key_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapped_master_key: Option<Vec<u8>>,
+    /// Phase 2 of #122. Format version of `wrapped_master_key`.
+    pub wrapped_master_key_format_version: i16,
     pub encrypted_private_key: Vec<u8>,
+    /// Phase 2 of #122. Format version of `encrypted_private_key`.
+    pub encrypted_private_key_format_version: i16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<Vec<u8>>,
 }
@@ -248,6 +252,14 @@ pub struct CreateApiKeyGrantRequest {
     pub wrapped_key: Vec<u8>,
     pub ephemeral_pubkey: Vec<u8>,
     pub nonce: Vec<u8>,
+    /// Issue #178 / residual #122 cleanup. `0` = legacy V0 X25519 wrap
+    /// (HKDF without key-bound salt, no AAD), `1` = V1 (HKDF salted with
+    /// eph_pub‖recipient_pub, AAD = same salt). Defaults to 0 when absent
+    /// so an older client that hasn't been updated yet still creates a
+    /// readable (V0) grant — consumers fall back to V0 unwrap on
+    /// `format_version = 0`.
+    #[serde(default)]
+    pub format_version: i16,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,6 +270,8 @@ pub struct ApiKeyGrantItem {
     pub ephemeral_pubkey: Vec<u8>,
     pub nonce: Vec<u8>,
     pub created_at: String,
+    /// Issue #178 / residual #122 cleanup. See [`CreateApiKeyGrantRequest::format_version`].
+    pub format_version: i16,
 }
 
 // --- Users ---

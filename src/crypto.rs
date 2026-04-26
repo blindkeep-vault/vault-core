@@ -20,6 +20,13 @@ pub enum CryptoError {
     InvalidKeyLength,
     #[error("invalid nonce length")]
     InvalidNonceLength,
+    /// Per-row `format_version` column (#122 Phase 2) carried a value
+    /// that this build doesn't know how to decode. Distinct from
+    /// `DecryptionFailed` so operability tooling can tell a forward-
+    /// compat mismatch (likely a deploy ordering issue) from an actual
+    /// AEAD authentication failure (likely tampering or a real bug).
+    #[error("unsupported format_version: {0}")]
+    UnsupportedFormatVersion(i16),
 }
 
 #[derive(Zeroize)]
@@ -103,12 +110,14 @@ pub fn derive_subkey(
     Ok(subkey)
 }
 
-/// Encrypt plaintext with a 256-bit key using XChaCha20-Poly1305.
-///
-/// **Deprecated:** Use [`encrypt_item_v1`] with AAD for all new encryption.
-/// This function is retained only for backwards compatibility tests.
-#[deprecated(note = "Use encrypt_item_v1 with AAD for all new encryption")]
-pub fn encrypt_item(
+/// V0 emit primitive (XChaCha20-Poly1305, no AAD). Test-only fixture:
+/// every production V0 emitter was removed in #176 (item blob/master/key
+/// wraps) and #178 (X25519 grant wrap). Kept compileable so the V0 read
+/// primitives (`decrypt_item`, `unwrap_key`) — which still serve legacy
+/// rows — remain testable against fresh ciphertext rather than only
+/// against vintage fixtures.
+#[cfg(test)]
+pub(crate) fn encrypt_item(
     key: &[u8; KEY_LEN],
     plaintext: &[u8],
 ) -> Result<EncryptedPayload, CryptoError> {
@@ -162,13 +171,14 @@ pub fn decrypt_item(
         .map_err(|_| CryptoError::DecryptionFailed)
 }
 
-/// Wrap an item key for a recipient using X25519 key exchange + XChaCha20-Poly1305.
-///
-/// **Deprecated:** Use [`wrap_key_for_recipient_v1`] for all new key wrapping.
-/// This function is retained for reading legacy V0-wrapped keys.
-#[deprecated(note = "Use wrap_key_for_recipient_v1 for all new key wrapping")]
-#[allow(deprecated)]
-pub fn wrap_key_for_recipient(
+/// V0 X25519 grant wrap test-only fixture. The production emitter was
+/// deleted in #178 (residual #122 cleanup) — every live emit path now
+/// uses [`wrap_key_for_recipient_v1`] with key-bound HKDF and AAD. Kept
+/// compileable so [`unwrap_key`], which still serves legacy
+/// `format_version = 0` rows on `api_key_grants`, can be exercised
+/// against a fresh roundtrip and not just static fixtures.
+#[cfg(test)]
+fn wrap_key_for_recipient_v0_for_test(
     item_key: &[u8; KEY_LEN],
     recipient_public_key: &[u8; PUBKEY_LEN],
 ) -> Result<WrappedKey, CryptoError> {
@@ -182,7 +192,7 @@ pub fn wrap_key_for_recipient(
     let recipient_pk = PublicKey::from(*recipient_public_key);
     let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pk);
 
-    // Reject non-contributory inputs (low-order points yield all-zero shared secret)
+    // Reject non-contributory inputs (low-order points yield all-zero shared secret).
     if shared_secret.as_bytes().iter().all(|&b| b == 0) {
         return Err(CryptoError::KeyDerivationFailed);
     }
@@ -483,6 +493,17 @@ pub fn generate_x25519_keypair() -> (Zeroizing<[u8; KEY_LEN]>, [u8; PUBKEY_LEN])
     (Zeroizing::new(secret.to_bytes()), *public.as_bytes())
 }
 
+/// Derive the X25519 public key from a 32-byte private key (scalar). This
+/// is `pubkey = scalar * basepoint`; use it when a consumer holds only the
+/// private half (e.g. a scoped api-key client unwrapping a V1 grant) and
+/// the V1 wrap helper needs the recipient's public key to reconstruct the
+/// HKDF salt and AAD.
+pub fn x25519_pubkey_from_privkey(private_key: &[u8; KEY_LEN]) -> [u8; PUBKEY_LEN] {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    let secret = StaticSecret::from(*private_key);
+    *PublicKey::from(&secret).as_bytes()
+}
+
 /// Derive a wrapping key and auth key from an API key secret using HKDF-SHA256.
 /// Returns (wrapping_key, auth_key) both as 32-byte arrays.
 #[allow(clippy::type_complexity)]
@@ -743,7 +764,8 @@ mod tests {
         let recipient_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
         let recipient_public = PublicKey::from(&recipient_secret);
 
-        let wrapped = wrap_key_for_recipient(&item_key, recipient_public.as_bytes()).unwrap();
+        let wrapped =
+            wrap_key_for_recipient_v0_for_test(&item_key, recipient_public.as_bytes()).unwrap();
 
         let unwrapped = unwrap_key(
             &recipient_secret.to_bytes(),

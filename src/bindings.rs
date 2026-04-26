@@ -8,6 +8,7 @@
 //! here we eliminate near-identical wrapper code on both sides.
 
 use crate::crypto::{self, MasterKey};
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -43,22 +44,22 @@ pub fn mk_from_bytes(bytes: &[u8]) -> Result<MasterKey, String> {
 // Key derivation
 // ---------------------------------------------------------------------------
 
-pub fn derive_key_impl(password: &str, salt: &[u8]) -> Result<Vec<u8>, String> {
+pub fn derive_key_impl(password: &str, salt: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     crypto::derive_master_key(password.as_bytes(), salt)
-        .map(|k| k.as_bytes().to_vec())
+        .map(|k| Zeroizing::new(k.as_bytes().to_vec()))
         .map_err(|e| e.to_string())
 }
 
-pub fn derive_key_legacy_impl(password: &str, salt: &[u8]) -> Result<Vec<u8>, String> {
+pub fn derive_key_legacy_impl(password: &str, salt: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     crypto::derive_master_key_legacy(password.as_bytes(), salt)
-        .map(|k| k.as_bytes().to_vec())
+        .map(|k| Zeroizing::new(k.as_bytes().to_vec()))
         .map_err(|e| e.to_string())
 }
 
-pub fn derive_subkey_impl(master_key: &[u8], info: &str) -> Result<Vec<u8>, String> {
+pub fn derive_subkey_impl(master_key: &[u8], info: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     let master = mk_from_bytes(master_key)?;
     crypto::derive_subkey(&master, info.as_bytes())
-        .map(|k| k.to_vec())
+        .map(|k| Zeroizing::new(k.to_vec()))
         .map_err(|e| e.to_string())
 }
 
@@ -66,52 +67,49 @@ pub fn derive_subkey_salted_impl(
     master_key: &[u8],
     salt: &[u8],
     info: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let master = mk_from_bytes(master_key)?;
     crypto::derive_subkey_salted(&master, salt, info.as_bytes())
-        .map(|k| k.to_vec())
+        .map(|k| Zeroizing::new(k.to_vec()))
         .map_err(|e| e.to_string())
 }
 
-pub fn derive_api_key_keys_impl(secret: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+#[allow(clippy::type_complexity)]
+pub fn derive_api_key_keys_impl(
+    secret: &[u8],
+) -> Result<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>), String> {
     let s = bytes_to_key32(secret, "secret")?;
     let (wk, ak) = crypto::derive_api_key_keys(&s).map_err(|e| e.to_string())?;
-    Ok((wk.to_vec(), ak.to_vec()))
+    Ok((Zeroizing::new(wk.to_vec()), Zeroizing::new(ak.to_vec())))
 }
 
 // ---------------------------------------------------------------------------
 // Key generation
 // ---------------------------------------------------------------------------
 
-pub fn generate_keypair_impl() -> (Vec<u8>, Vec<u8>) {
+pub fn generate_keypair_impl() -> (Zeroizing<Vec<u8>>, Vec<u8>) {
     let (private_key, public_key) = crypto::generate_x25519_keypair();
-    (private_key.to_vec(), public_key.to_vec())
+    (Zeroizing::new(private_key.to_vec()), public_key.to_vec())
 }
 
-pub fn generate_random_key_impl() -> Vec<u8> {
+pub fn generate_random_key_impl() -> Zeroizing<Vec<u8>> {
     use rand::RngCore;
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new(vec![0u8; 32]);
     rand::rngs::OsRng.fill_bytes(&mut key);
-    key.to_vec()
+    key
 }
 
 // ---------------------------------------------------------------------------
 // Symmetric encryption
 // ---------------------------------------------------------------------------
 
-/// Encrypt plaintext (V0, no AAD). Kept for backwards compatibility.
-#[allow(deprecated)]
-pub fn encrypt_impl(key: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+pub fn decrypt_impl(
+    key: &[u8],
+    ciphertext: &[u8],
+    nonce: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let key_arr = bytes_to_key32(key, "key")?;
-    let payload = crypto::encrypt_item(&key_arr, plaintext).map_err(|e| e.to_string())?;
-    Ok((payload.ciphertext, payload.nonce.to_vec()))
-}
-
-pub fn decrypt_impl(key: &[u8], ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>, String> {
-    let key_arr = bytes_to_key32(key, "key")?;
-    crypto::decrypt_item(&key_arr, ciphertext, nonce)
-        .map(|z| (*z).clone())
-        .map_err(|e| e.to_string())
+    crypto::decrypt_item(&key_arr, ciphertext, nonce).map_err(|e| e.to_string())
 }
 
 /// Encrypt with AAD (V1 format). Returns (ciphertext, nonce).
@@ -130,43 +128,27 @@ pub fn decrypt_auto_impl(
     ciphertext: &[u8],
     nonce: &[u8],
     aad: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let key_arr = bytes_to_key32(key, "key")?;
-    crypto::decrypt_item_auto(&key_arr, ciphertext, nonce, aad)
-        .map(|z| (*z).clone())
-        .map_err(|e| e.to_string())
+    crypto::decrypt_item_auto(&key_arr, ciphertext, nonce, aad).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
-// Asymmetric key wrapping (V0)
+// Asymmetric key unwrap (V0). The V0 *wrap* shim was removed in #178 along
+// with its only caller; V0 unwrap stays so legacy `format_version = 0`
+// `api_key_grants` rows remain readable until they age out.
 // ---------------------------------------------------------------------------
-
-/// Wrap key for recipient (V0). Kept for backwards compatibility.
-#[allow(clippy::type_complexity, deprecated)]
-pub fn wrap_key_for_recipient_impl(
-    item_key: &[u8],
-    recipient_pubkey: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
-    let ik = bytes_to_key32(item_key, "item key")?;
-    let pk = bytes_to_key32(recipient_pubkey, "recipient public key")?;
-    let wrapped = crypto::wrap_key_for_recipient(&ik, &pk).map_err(|e| e.to_string())?;
-    Ok((
-        wrapped.wrapped_key,
-        wrapped.ephemeral_pubkey.to_vec(),
-        wrapped.nonce.to_vec(),
-    ))
-}
 
 pub fn unwrap_key_impl(
     privkey: &[u8],
     ephemeral_pub: &[u8],
     wrapped: &[u8],
     nonce: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let sk = bytes_to_key32(privkey, "private key")?;
     let ep = bytes_to_key32(ephemeral_pub, "ephemeral public key")?;
     crypto::unwrap_key(&sk, &ep, wrapped, nonce)
-        .map(|k| k.to_vec())
+        .map(|k| Zeroizing::new(k.to_vec()))
         .map_err(|e| e.to_string())
 }
 
@@ -196,12 +178,12 @@ pub fn unwrap_key_v1_impl(
     wrapped: &[u8],
     nonce: &[u8],
     recipient_pubkey: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let sk = bytes_to_key32(privkey, "private key")?;
     let ep = bytes_to_key32(ephemeral_pub, "ephemeral public key")?;
     let rpk = bytes_to_key32(recipient_pubkey, "recipient public key")?;
     crypto::unwrap_key_v1(&sk, &ep, wrapped, nonce, &rpk)
-        .map(|k| k.to_vec())
+        .map(|k| Zeroizing::new(k.to_vec()))
         .map_err(|e| e.to_string())
 }
 
@@ -225,12 +207,12 @@ pub fn unwrap_grant_key_impl(
     ephemeral_pub: &[u8],
     grant_wrapped_key: &[u8],
     recipient_pubkey: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let sk = bytes_to_key32(privkey, "private key")?;
     let ep = bytes_to_key32(ephemeral_pub, "ephemeral public key")?;
     let rpk = bytes_to_key32(recipient_pubkey, "recipient public key")?;
     crypto::unwrap_grant_key(&sk, &ep, grant_wrapped_key, &rpk)
-        .map(|k| k.to_vec())
+        .map(|k| Zeroizing::new(k.to_vec()))
         .map_err(|e| e.to_string())
 }
 
@@ -252,10 +234,10 @@ pub fn wrap_key_symmetric_impl(wrapping_key: &[u8], key_to_wrap: &[u8]) -> Resul
 pub fn decrypt_private_key_impl(
     enc_key: &[u8],
     encrypted_private_key: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let ek = bytes_to_key32(enc_key, "encryption key")?;
     crypto::decrypt_private_key(&ek, encrypted_private_key)
-        .map(|k| k.to_vec())
+        .map(|k| Zeroizing::new(k.to_vec()))
         .map_err(|e| e.to_string())
 }
 
@@ -272,10 +254,10 @@ pub fn encrypt_claim_secret_impl(claim_key: &[u8], link_secret: &[u8]) -> Result
 pub fn decrypt_claim_secret_impl(
     claim_key: &[u8],
     claim_ciphertext: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let ck = bytes_to_key32(claim_key, "claim key")?;
     crypto::decrypt_claim_secret(&ck, claim_ciphertext)
-        .map(|k| k.to_vec())
+        .map(|k| Zeroizing::new(k.to_vec()))
         .map_err(|e| e.to_string())
 }
 
@@ -346,8 +328,16 @@ pub fn pad_plaintext_impl(data: &[u8]) -> Vec<u8> {
     crate::padding::pad_plaintext(data)
 }
 
+/// Lenient FFI unpad: returns the raw input on prefix failure.
+///
+/// Kept lenient deliberately — vault-ui callers wrap every `unpadPlaintext`
+/// invocation in `try { ... } catch { return plainBytes; }` and would
+/// silently absorb a thrown error to fall back to raw bytes anyway.
+/// Tightening here would require auditing the JS catch sites and adding
+/// per-item version tracking to distinguish tampered V1 from legacy
+/// un-padded V0. Tracked under #129 L-1.
 pub fn unpad_plaintext_impl(data: &[u8]) -> Vec<u8> {
-    crate::padding::unpad(data).to_vec()
+    crate::padding::unpad(data).unwrap_or(data).to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -365,8 +355,8 @@ pub fn derive_drop_lookup_key_impl(mnemonic: &str) -> String {
 }
 
 #[cfg(feature = "drops")]
-pub fn derive_drop_wrapping_key_impl(mnemonic: &str, version: i32) -> Vec<u8> {
-    crate::drops::derive_drop_wrapping_key(mnemonic, version).to_vec()
+pub fn derive_drop_wrapping_key_impl(mnemonic: &str, version: i32) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(crate::drops::derive_drop_wrapping_key(mnemonic, version).to_vec())
 }
 
 #[cfg(feature = "drops")]
@@ -377,10 +367,13 @@ pub fn wrap_drop_key_impl(wrapping_key: &[u8], drop_key: &[u8]) -> Result<Vec<u8
 }
 
 #[cfg(feature = "drops")]
-pub fn unwrap_drop_key_impl(wrapping_key: &[u8], wrapped: &[u8]) -> Result<Vec<u8>, String> {
+pub fn unwrap_drop_key_impl(
+    wrapping_key: &[u8],
+    wrapped: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let wk = bytes_to_key32(wrapping_key, "wrapping key")?;
     crate::drops::unwrap_drop_key(&wk, wrapped)
-        .map(|k| k.to_vec())
+        .map(|k| Zeroizing::new(k.to_vec()))
         .map_err(|e| e.to_string())
 }
 
@@ -395,8 +388,8 @@ pub fn validate_bip39_mnemonic_impl(mnemonic: &str) -> bool {
 }
 
 #[cfg(feature = "drops")]
-pub fn derive_will_wrapping_key_impl(mnemonic: &str, version: i32) -> Vec<u8> {
-    crate::drops::derive_will_wrapping_key(mnemonic, version).to_vec()
+pub fn derive_will_wrapping_key_impl(mnemonic: &str, version: i32) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(crate::drops::derive_will_wrapping_key(mnemonic, version).to_vec())
 }
 
 #[cfg(feature = "drops")]
@@ -406,9 +399,12 @@ pub fn derive_will_lookup_key_impl(mnemonic: &str) -> String {
 
 /// Returns (wrapping_key, auth_key).
 #[cfg(feature = "drops")]
-pub fn derive_recovery_keys_impl(mnemonic: &str, version: i32) -> (Vec<u8>, Vec<u8>) {
+pub fn derive_recovery_keys_impl(
+    mnemonic: &str,
+    version: i32,
+) -> (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) {
     let (wk, ak) = crate::drops::derive_recovery_keys(mnemonic, version);
-    (wk.to_vec(), ak.to_vec())
+    (Zeroizing::new(wk.to_vec()), Zeroizing::new(ak.to_vec()))
 }
 
 // ---------------------------------------------------------------------------
@@ -430,12 +426,29 @@ pub fn decrypt_blob_impl(
     item_key: &[u8],
     blob_data: &[u8],
     user_id: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    decrypt_blob_versioned_impl(item_key, blob_data, user_id, None)
+}
+
+/// Decrypt an encrypted blob with an explicit `format_version` from the
+/// per-row column added in #122 Phase 2 (migrations 049-062). Pass `None`
+/// to keep the legacy first-byte heuristic (back-compat for FFI consumers
+/// not yet threaded through). See
+/// [`crate::envelope::decrypt_blob_bytes_versioned`] for the semantics.
+pub fn decrypt_blob_versioned_impl(
+    item_key: &[u8],
+    blob_data: &[u8],
+    user_id: &str,
+    format_version: Option<i16>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let ik = bytes_to_key32(item_key, "item key")?;
     let decrypted =
-        crate::envelope::decrypt_blob_bytes(blob_data, &ik, user_id).map_err(|e| e.to_string())?;
-    let unpadded = crate::padding::unpad(&decrypted);
-    Ok(unpadded.to_vec())
+        crate::envelope::decrypt_blob_bytes_versioned(blob_data, &ik, user_id, format_version)
+            .map_err(|e| e.to_string())?;
+    // Lenient: matches the FFI `unpad_plaintext_impl` contract; legacy
+    // un-padded V0 callers depend on the raw-bytes fallback. See #129 L-1.
+    let unpadded = crate::padding::unpad(&decrypted).unwrap_or(&decrypted[..]);
+    Ok(Zeroizing::new(unpadded.to_vec()))
 }
 
 // ---------------------------------------------------------------------------
@@ -443,9 +456,9 @@ pub fn decrypt_blob_impl(
 // ---------------------------------------------------------------------------
 
 /// Returns (prefix, secret_bytes).
-pub fn parse_api_key_impl(raw_key: &str) -> Result<(String, Vec<u8>), String> {
+pub fn parse_api_key_impl(raw_key: &str) -> Result<(String, Zeroizing<Vec<u8>>), String> {
     let (prefix, secret) = crate::unlock::parse_api_key(raw_key).map_err(|e| e.to_string())?;
-    Ok((prefix, secret.to_vec()))
+    Ok((prefix, Zeroizing::new(secret.to_vec())))
 }
 
 // ---------------------------------------------------------------------------
@@ -487,10 +500,10 @@ pub mod client_ops {
         user_id: &str,
         wrapped_key: &[u8],
         nonce: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
         let mk = mk_from_bytes(master_key)?;
         crate::client::unwrap_owned_item_key(&mk, user_id, wrapped_key, nonce)
-            .map(|k| k.to_vec())
+            .map(|k| Zeroizing::new(k.to_vec()))
             .map_err(|e| e.to_string())
     }
 
@@ -531,14 +544,14 @@ pub mod client_ops {
     /// Returns (auth_key_hex, public_key, encrypted_private_key, client_salt, master_key_bytes).
     pub fn prepare_registration_impl(
         password: &str,
-    ) -> Result<(String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    ) -> Result<(String, Vec<u8>, Vec<u8>, Vec<u8>, Zeroizing<Vec<u8>>), String> {
         let reg = crate::client::prepare_registration(password).map_err(|e| e.to_string())?;
         Ok((
             reg.auth_key_hex,
             reg.public_key.to_vec(),
             reg.encrypted_private_key,
             reg.client_salt,
-            reg.master_key.as_bytes().to_vec(),
+            Zeroizing::new(reg.master_key.as_bytes().to_vec()),
         ))
     }
 
@@ -546,10 +559,13 @@ pub mod client_ops {
     pub fn prepare_login_impl(
         password: &str,
         client_salt: &[u8],
-    ) -> Result<(Vec<u8>, String), String> {
+    ) -> Result<(Zeroizing<Vec<u8>>, String), String> {
         let login =
             crate::client::prepare_login(password, client_salt).map_err(|e| e.to_string())?;
-        Ok((login.master_key.as_bytes().to_vec(), login.auth_key_hex))
+        Ok((
+            Zeroizing::new(login.master_key.as_bytes().to_vec()),
+            login.auth_key_hex,
+        ))
     }
 
     /// Returns (encrypted_blob_b64, wrapped_key, nonce).
@@ -608,7 +624,17 @@ pub mod client_ops {
         encrypted_private_key: &[u8],
         master_key: &[u8],
         user_id: &str,
-    ) -> Result<(String, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    ) -> Result<
+        (
+            String,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Zeroizing<Vec<u8>>,
+        ),
+        String,
+    > {
         let mk = mk_from_bytes(master_key)?;
         let p = crate::client::prepare_password_change(
             current_password,
@@ -625,18 +651,18 @@ pub mod client_ops {
             p.new_client_salt,
             p.new_encrypted_master_key,
             p.new_encrypted_private_key,
-            p.new_master_key.as_bytes().to_vec(),
+            Zeroizing::new(p.new_master_key.as_bytes().to_vec()),
         ))
     }
 
     /// Returns (secret, key_prefix, auth_key_hex, wrapped_master_key).
     pub fn prepare_api_key_full_impl(
         master_key: &[u8],
-    ) -> Result<(Vec<u8>, String, String, Vec<u8>), String> {
+    ) -> Result<(Zeroizing<Vec<u8>>, String, String, Vec<u8>), String> {
         let mk = mk_from_bytes(master_key)?;
         let p = crate::client::prepare_api_key_full(&mk).map_err(|e| e.to_string())?;
         Ok((
-            p.secret.to_vec(),
+            Zeroizing::new(p.secret[..].to_vec()),
             p.key_prefix,
             p.auth_key_hex,
             p.wrapped_master_key,
@@ -646,10 +672,10 @@ pub mod client_ops {
     /// Returns (secret, key_prefix, auth_key_hex, encrypted_private_key, public_key).
     #[allow(clippy::type_complexity)]
     pub fn prepare_api_key_scoped_impl(
-    ) -> Result<(Vec<u8>, String, String, Vec<u8>, Vec<u8>), String> {
+    ) -> Result<(Zeroizing<Vec<u8>>, String, String, Vec<u8>, Vec<u8>), String> {
         let p = crate::client::prepare_api_key_scoped().map_err(|e| e.to_string())?;
         Ok((
-            p.secret.to_vec(),
+            Zeroizing::new(p.secret[..].to_vec()),
             p.key_prefix,
             p.auth_key_hex,
             p.encrypted_private_key,
@@ -676,10 +702,10 @@ pub mod client_ops {
         let items: Vec<crate::client::WillItemKey> = entries
             .into_iter()
             .map(|e| {
-                let mut key = [0u8; 32];
                 if e.item_key.len() != 32 {
                     return Err("item_key must be 32 bytes".to_string());
                 }
+                let mut key = Zeroizing::new([0u8; 32]);
                 key.copy_from_slice(&e.item_key);
                 Ok(crate::client::WillItemKey {
                     item_id: e.item_id,
@@ -703,11 +729,11 @@ pub mod client_ops {
     pub fn decrypt_private_key_from_master_impl(
         master_key: &[u8],
         encrypted_private_key: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
         let mk = mk_from_bytes(master_key)?;
         let pk = crate::client::decrypt_private_key_from_master(&mk, encrypted_private_key)
             .map_err(|e| e.to_string())?;
-        Ok(pk.to_vec())
+        Ok(Zeroizing::new(pk.to_vec()))
     }
 
     /// Wrap a raw 32-byte key under the user's encryption subkey.
@@ -775,7 +801,18 @@ pub mod client_ops {
     pub fn prepare_link_grant_impl(
         item_key: &[u8],
         file_key: Option<&[u8]>,
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String, Vec<u8>), String> {
+    ) -> Result<
+        (
+            Vec<u8>,
+            Vec<u8>,
+            Zeroizing<Vec<u8>>,
+            Zeroizing<Vec<u8>>,
+            Vec<u8>,
+            String,
+            Vec<u8>,
+        ),
+        String,
+    > {
         let ik = bytes_to_key32(item_key, "item key")?;
         let fk = match file_key {
             Some(b) if !b.is_empty() => Some(bytes_to_key32(b, "file key")?),
@@ -785,8 +822,8 @@ pub mod client_ops {
         Ok((
             lg.wrapped_key,
             lg.nonce.to_vec(),
-            lg.link_secret.to_vec(),
-            lg.claim_key.to_vec(),
+            Zeroizing::new(lg.link_secret.to_vec()),
+            Zeroizing::new(lg.claim_key.to_vec()),
             lg.claim_ciphertext,
             lg.claim_token_hash,
             lg.file_wrapped_key.unwrap_or_default(),
@@ -820,10 +857,10 @@ pub mod client_ops {
         claim_ciphertext: &[u8],
         wrapped_key: &[u8],
         nonce: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
         let ck = bytes_to_key32(claim_key, "claim key")?;
         crate::client::unwrap_link_grant_key(&ck, claim_ciphertext, wrapped_key, nonce)
-            .map(|k| k.to_vec())
+            .map(|k| Zeroizing::new(k.to_vec()))
             .map_err(|e| e.to_string())
     }
 
@@ -849,10 +886,10 @@ pub mod client_ops {
         let items: Vec<crate::client::WillItemKey> = entries
             .into_iter()
             .map(|e| {
-                let mut key = [0u8; 32];
                 if e.item_key.len() != 32 {
                     return Err("item_key must be 32 bytes".to_string());
                 }
+                let mut key = Zeroizing::new([0u8; 32]);
                 key.copy_from_slice(&e.item_key);
                 Ok(crate::client::WillItemKey {
                     item_id: e.item_id,

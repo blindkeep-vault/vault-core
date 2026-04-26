@@ -285,6 +285,12 @@ pub fn decode_jwt(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::err
     .map(|td| td.claims)
 }
 
+/// Decode a JWT without enforcing the `exp` claim.
+///
+/// Refresh-only escape hatch. This MUST NOT be used for authentication —
+/// returning claims here is not proof the bearer is currently authorized.
+/// Callers must combine it with their own bounded freshness check
+/// (e.g. reject if `now - claims.exp > refresh_window`).
 pub fn decode_jwt_allow_expired(
     token: &str,
     secret: &str,

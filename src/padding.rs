@@ -1,16 +1,37 @@
 use rand::RngCore;
 
+/// Errors from [`unpad`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PadError {
+    /// Input is shorter than the 4-byte length prefix.
+    #[error("padded input too short ({0} bytes, need >= 4)")]
+    TooShort(usize),
+    /// Length prefix declares more bytes than the input contains. Indicates
+    /// either tampering of an AEAD-valid plaintext (bogus prefix) or a
+    /// non-padded blob misrouted into a padded path.
+    #[error("declared payload length {declared} exceeds available {available} bytes")]
+    LengthOverrun { declared: usize, available: usize },
+}
+
 /// Remove padding: extract original data using the 4-byte BE length prefix.
-/// Falls back to returning the full input if the prefix is invalid.
-pub fn unpad(data: &[u8]) -> &[u8] {
+///
+/// Returns `Err` if the prefix is missing or declares more bytes than the
+/// input contains. Callers that legitimately accept un-padded legacy V0 input
+/// must handle the error explicitly (e.g. `unpad(d).unwrap_or(d)`); see
+/// `client::decrypt_link_grant` for the canonical legacy fallback.
+pub fn unpad(data: &[u8]) -> Result<&[u8], PadError> {
     if data.len() < 4 {
-        return data;
+        return Err(PadError::TooShort(data.len()));
     }
     let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if len > data.len() - 4 {
-        return data;
+    let available = data.len() - 4;
+    if len > available {
+        return Err(PadError::LengthOverrun {
+            declared: len,
+            available,
+        });
     }
-    &data[4..4 + len]
+    Ok(&data[4..4 + len])
 }
 
 /// Calculate padded bucket size for a given plaintext length.
@@ -90,7 +111,7 @@ mod tests {
         for data in cases {
             let padded = pad_plaintext(data);
             assert_eq!(padded.len(), padded_size(data.len()));
-            let recovered = unpad(&padded);
+            let recovered = unpad(&padded).expect("pad/unpad roundtrip");
             assert_eq!(recovered, *data);
         }
     }
@@ -105,15 +126,29 @@ mod tests {
     }
 
     #[test]
-    fn unpad_corrupted_prefix() {
-        // Length prefix says more data than available — return full input
+    fn unpad_corrupted_prefix_errors() {
+        // Length prefix says more data than available — return PadError, do
+        // NOT silently hand back the raw input.
         let data = [0, 0, 0, 100, 1, 2, 3];
-        assert_eq!(unpad(&data), &data);
+        assert_eq!(
+            unpad(&data),
+            Err(PadError::LengthOverrun {
+                declared: 100,
+                available: 3,
+            })
+        );
     }
 
     #[test]
-    fn unpad_too_short() {
-        assert_eq!(unpad(&[1, 2, 3]), &[1, 2, 3]);
-        assert_eq!(unpad(&[]), &[] as &[u8]);
+    fn unpad_too_short_errors() {
+        assert_eq!(unpad(&[1, 2, 3]), Err(PadError::TooShort(3)));
+        assert_eq!(unpad(&[]), Err(PadError::TooShort(0)));
+    }
+
+    #[test]
+    fn unpad_zero_length_prefix() {
+        // Edge case: prefix says 0 bytes — return empty slice, not error.
+        let data = [0, 0, 0, 0, 0xAA, 0xBB];
+        assert_eq!(unpad(&data), Ok(&[] as &[u8]));
     }
 }
