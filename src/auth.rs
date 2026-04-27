@@ -349,11 +349,27 @@ pub fn check_event_log_read_allowed(claims: &Claims, log_id: Uuid) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::OrgRole;
 
     const TEST_SECRET: &str = "test-secret-key-for-jwt-tests";
 
     fn test_user_id() -> Uuid {
         Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+    }
+
+    /// Decode the (unverified) JWT payload to a JSON value. Used by
+    /// shape-pinning tests that need to inspect the on-the-wire claim
+    /// keys, not the round-tripped struct.
+    fn decode_payload(token: &str) -> serde_json::Value {
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let pad = (4 - payload_b64.len() % 4) % 4;
+        let padded = format!("{payload_b64}{}", "=".repeat(pad));
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE,
+            padded.as_bytes(),
+        )
+        .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[test]
@@ -493,30 +509,10 @@ mod tests {
         // The client parses this value directly from the JWT payload.
         let token =
             encode_jwt_limited(test_user_id(), "user@example.com", false, TEST_SECRET).unwrap();
-        let payload_b64 = token.split('.').nth(1).unwrap();
-        let pad = (4 - payload_b64.len() % 4) % 4;
-        let mut padded = payload_b64.to_string();
-        padded.extend(std::iter::repeat('=').take(pad));
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE,
-            padded.as_bytes(),
-        )
-        .unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(payload["session_kind"], "limited");
+        assert_eq!(decode_payload(&token)["session_kind"], "limited");
 
         let token2 = encode_jwt(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
-        let payload_b64 = token2.split('.').nth(1).unwrap();
-        let pad = (4 - payload_b64.len() % 4) % 4;
-        let mut padded = payload_b64.to_string();
-        padded.extend(std::iter::repeat('=').take(pad));
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE,
-            padded.as_bytes(),
-        )
-        .unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(payload["session_kind"], "full");
+        assert_eq!(decode_payload(&token2)["session_kind"], "full");
     }
 
     #[test]
@@ -605,16 +601,7 @@ mod tests {
         // active org. Important for diff-noise-free upgrades and for any
         // client that compares payloads against a recorded snapshot.
         let token = encode_jwt(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
-        let payload_b64 = token.split('.').nth(1).unwrap();
-        let pad = (4 - payload_b64.len() % 4) % 4;
-        let mut padded = payload_b64.to_string();
-        padded.extend(std::iter::repeat('=').take(pad));
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE,
-            padded.as_bytes(),
-        )
-        .unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let payload = decode_payload(&token);
         assert!(
             payload.get("active_org_id").is_none(),
             "active_org_id must be omitted when None"
@@ -663,16 +650,7 @@ mod tests {
             TEST_SECRET,
         )
         .unwrap();
-        let payload_b64 = token.split('.').nth(1).unwrap();
-        let pad = (4 - payload_b64.len() % 4) % 4;
-        let mut padded = payload_b64.to_string();
-        padded.extend(std::iter::repeat('=').take(pad));
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE,
-            padded.as_bytes(),
-        )
-        .unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let payload = decode_payload(&token);
         assert!(payload.get("active_org_id").is_none());
         assert!(payload.get("org_role").is_none());
     }
@@ -696,5 +674,115 @@ mod tests {
         let claims: Claims = serde_json::from_value(payload).unwrap();
         assert_eq!(claims.active_org_id, Some(org_id));
         assert_eq!(claims.org_role.as_deref(), Some("billing_admin"));
+    }
+
+    #[test]
+    fn personal_jwt_payload_keys_are_pinned() {
+        // Pin the exact claim key set on a personal-session JWT. Adding
+        // a new field to `Claims` without `skip_serializing_if` would
+        // silently widen every issued token; pre-org-accounts clients
+        // that snapshot or proxy the payload would see drift. Forcing
+        // this assertion to update is the explicit signoff.
+        let token = encode_jwt(test_user_id(), "user@example.com", true, TEST_SECRET).unwrap();
+        let payload = decode_payload(&token);
+        let obj = payload
+            .as_object()
+            .expect("JWT payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "email",
+                "email_verified",
+                "exp",
+                "iat",
+                "needs_password_setup",
+                "session_kind",
+                "sub",
+            ],
+            "personal JWT payload key set drifted",
+        );
+    }
+
+    #[test]
+    fn org_bound_jwt_payload_keys_are_pinned() {
+        let org_id = Uuid::parse_str("770e8400-e29b-41d4-a716-446655440000").unwrap();
+        let token = encode_jwt_with_org(
+            test_user_id(),
+            "user@example.com",
+            true,
+            false,
+            Some(org_id),
+            Some(OrgRole::Owner.as_str().to_string()),
+            TEST_SECRET,
+        )
+        .unwrap();
+        let payload = decode_payload(&token);
+        let obj = payload
+            .as_object()
+            .expect("JWT payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "active_org_id",
+                "email",
+                "email_verified",
+                "exp",
+                "iat",
+                "needs_password_setup",
+                "org_role",
+                "session_kind",
+                "sub",
+            ],
+            "org-bound JWT payload key set drifted",
+        );
+    }
+
+    #[test]
+    fn org_role_wire_strings_are_pinned() {
+        // Pin the *literal* wire strings the JWT payload is required to
+        // carry — independently of `OrgRole::as_str`. A rename in
+        // `as_str()` (e.g. "billing_admin" -> "billingAdmin") would
+        // break this test even if `from_str` was updated in lockstep,
+        // because these literals are the public contract — clients,
+        // the `org_members.role` CHECK constraint (migration 041), and
+        // any external consumer pinning the JWT shape rely on them.
+        use std::str::FromStr;
+
+        let org_id = Uuid::parse_str("770e8400-e29b-41d4-a716-446655440000").unwrap();
+        let cases: &[(OrgRole, &str)] = &[
+            (OrgRole::Owner, "owner"),
+            (OrgRole::BillingAdmin, "billing_admin"),
+            (OrgRole::Member, "member"),
+        ];
+
+        for &(role, expected_wire) in cases {
+            let token = encode_jwt_with_org(
+                test_user_id(),
+                "user@example.com",
+                true,
+                false,
+                Some(org_id),
+                Some(role.as_str().to_string()),
+                TEST_SECRET,
+            )
+            .unwrap();
+            let wire = decode_payload(&token)["org_role"]
+                .as_str()
+                .expect("org_role must be a JSON string")
+                .to_owned();
+            assert_eq!(
+                wire, expected_wire,
+                "JWT wire string for {role:?} drifted from contract",
+            );
+            assert_eq!(
+                OrgRole::from_str(&wire).unwrap(),
+                role,
+                "wire string {wire:?} no longer parses to {role:?}",
+            );
+        }
     }
 }
