@@ -330,14 +330,32 @@ pub fn pad_plaintext_impl(data: &[u8]) -> Vec<u8> {
 
 /// Lenient FFI unpad: returns the raw input on prefix failure.
 ///
-/// Kept lenient deliberately — vault-ui callers wrap every `unpadPlaintext`
-/// invocation in `try { ... } catch { return plainBytes; }` and would
+/// Kept lenient deliberately — the remaining vault-ui callers wrap
+/// `unpadPlaintext` in `try { ... } catch { return plainBytes; }` and would
 /// silently absorb a thrown error to fall back to raw bytes anyway.
-/// Tightening here would require auditing the JS catch sites and adding
-/// per-item version tracking to distinguish tampered V1 from legacy
-/// un-padded V0. Tracked under #129 L-1.
+/// Tightening here would require completing a padding backfill for item and
+/// file blobs written before padding existed, since nothing distinguishes a
+/// tampered V1 plaintext from a legacy un-padded one. Tracked under #129 L-1;
+/// see `doc/UNPAD_AUDIT_REPORT.md` for the per-call-site status.
+///
+/// Call sites that *can* prove their input is always padded use
+/// [`unpad_plaintext_strict_impl`] instead.
 pub fn unpad_plaintext_impl(data: &[u8]) -> Vec<u8> {
     crate::padding::unpad(data).unwrap_or(data).to_vec()
+}
+
+/// Strict FFI unpad: propagates [`crate::padding::PadError`] as a string.
+///
+/// Use from call sites that can prove every blob they read was written by a
+/// padding-era client — currently only anonymous drop blobs, which are created
+/// fresh by `encryptFileBytesAnonymous` and never migrated (see
+/// `doc/UNPAD_AUDIT_REPORT.md`). Every other FFI caller must keep using
+/// [`unpad_plaintext_impl`] until the padding backfill for item/file blobs
+/// completes. Tracked under #129 L-1.
+pub fn unpad_plaintext_strict_impl(data: &[u8]) -> Result<Vec<u8>, String> {
+    crate::padding::unpad(data)
+        .map(|d| d.to_vec())
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -940,5 +958,54 @@ pub mod parsing_ops {
         crate::parsing::parse_grant_url(url)
             .map(|gl| (gl.grant_id, gl.claim_key_b64))
             .ok_or_else(|| "could not parse grant URL".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::padding::pad_plaintext;
+
+    #[test]
+    fn unpad_lenient_and_strict_agree_on_padded_input() {
+        let padded = pad_plaintext(b"hello world");
+        assert_eq!(unpad_plaintext_impl(&padded), b"hello world");
+        assert_eq!(
+            unpad_plaintext_strict_impl(&padded).unwrap(),
+            b"hello world"
+        );
+    }
+
+    #[test]
+    fn unpad_lenient_passes_through_unpadded_input() {
+        // Legacy pre-padding plaintext: the 4-byte prefix overruns the buffer.
+        // The lenient binding hands back the raw bytes — this is what keeps the
+        // six remaining vault-ui catch sites working. See #129 L-1.
+        let legacy = b"not padded at all";
+        assert_eq!(unpad_plaintext_impl(legacy), legacy);
+    }
+
+    #[test]
+    fn unpad_strict_rejects_unpadded_input() {
+        let legacy = b"not padded at all";
+        let err = unpad_plaintext_strict_impl(legacy).unwrap_err();
+        assert!(err.contains("exceeds available"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unpad_strict_rejects_short_input() {
+        let err = unpad_plaintext_strict_impl(b"abc").unwrap_err();
+        assert!(err.contains("too short"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unpad_strict_rejects_tampered_length_prefix() {
+        // AEAD-valid plaintext whose length prefix was corrupted: the lenient
+        // binding silently yields the whole padded buffer (the failure mode
+        // that corrupts drop downloads), the strict one errors.
+        let mut padded = pad_plaintext(b"secret");
+        padded[0] = 0xFF;
+        assert_eq!(unpad_plaintext_impl(&padded), padded);
+        assert!(unpad_plaintext_strict_impl(&padded).is_err());
     }
 }
