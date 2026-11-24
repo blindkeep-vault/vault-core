@@ -10,6 +10,7 @@ Zero-knowledge cryptographic primitives for the [BlindKeep](https://blindkeep.co
 | **Argon2id** | Password-based key derivation (64 MiB, 3 iterations) |
 | **HKDF-SHA256** | Subkey derivation (encryption, wrapping, grants) |
 | **X25519** | Ephemeral key exchange for grant sharing |
+| **RSA-OAEP-SHA-256** | Wrapping item keys to KMS-held recipient keys (encryption only, `rsa-oaep` feature) |
 | **Ed25519** | Notarization signatures (strict verification) |
 | **PBKDF2-HMAC-SHA512** | Drop wrapping key derivation (600k iterations) |
 | **BIP39** | Mnemonic generation for drops |
@@ -19,6 +20,7 @@ Zero-knowledge cryptographic primitives for the [BlindKeep](https://blindkeep.co
 - **`crypto`** -- Master key derivation, item encryption/decryption (V0/V1 with AAD), key wrapping for recipients and grants, X25519 keypair generation, Ed25519 signing
 - **`envelope`** -- SecretBlob serialization, inline envelope decryption, version-aware blob handling
 - **`unlock`** -- API key parsing (`vk_PREFIX_SECRET`), master key unwrapping from encrypted storage (V0/V1 auto-detection)
+- **`rsa_oaep`** -- RSA-OAEP recipient variant (`rsa-oaep-kms`): wrap an item key to an RSA-3072/4096 public key, unwrap through a caller-supplied KMS decrypt
 - **`drops`** -- BIP39 mnemonic generation, drop lookup key derivation, wrapping key derivation, drop key wrap/unwrap
 - **`padding`** -- Random-padded bucket sizing to prevent length-based traffic analysis
 - **`policy`** -- Grant access policies (TTL, max views, allowed operations, IP allowlists)
@@ -30,6 +32,7 @@ Zero-knowledge cryptographic primitives for the [BlindKeep](https://blindkeep.co
 | Feature | Enables |
 |---------|---------|
 | `drops` | BIP39 mnemonic, PBKDF2 drop key derivation |
+| `rsa-oaep` | `rsa_oaep` module. Off by default; pulls in the `rsa` crate (encryption only, see RUSTSEC-2023-0071 in `deny.toml`) |
 | `server` | JWT auth (`auth` module), Argon2 hash verification (`hashing` module), HTTP network helpers |
 
 ## Security properties

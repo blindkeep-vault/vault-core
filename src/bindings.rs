@@ -188,6 +188,21 @@ pub fn unwrap_key_v1_impl(
 }
 
 // ---------------------------------------------------------------------------
+// RSA-OAEP recipient (#297). Wrap only: unwrapping runs in the recipient's
+// KMS, so no binding exposes RSA decryption.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rsa-oaep")]
+pub fn wrap_key_for_recipient_rsa_oaep_impl(
+    item_key: &[u8],
+    recipient_spki_der: &[u8],
+) -> Result<Vec<u8>, String> {
+    let ik = Zeroizing::new(bytes_to_key32(item_key, "item key")?);
+    crate::rsa_oaep::wrap_key_for_recipient_rsa_oaep(&ik, recipient_spki_der)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Grant key wrapping
 // ---------------------------------------------------------------------------
 

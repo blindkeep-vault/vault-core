@@ -20,6 +20,10 @@ pub enum CryptoError {
     InvalidKeyLength,
     #[error("invalid nonce length")]
     InvalidNonceLength,
+    /// A public key failed to parse or is outside the accepted parameters
+    /// (for example an RSA modulus below 3072 bits).
+    #[error("invalid key")]
+    InvalidKey,
     /// Per-row `format_version` column (#122 Phase 2) carried a value
     /// that this build doesn't know how to decode. Distinct from
     /// `DecryptionFailed` so operability tooling can tell a forward-

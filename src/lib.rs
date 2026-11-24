@@ -19,6 +19,8 @@ pub mod padding;
 pub mod parsing;
 pub mod policy;
 pub mod requests;
+#[cfg(feature = "rsa-oaep")]
+pub mod rsa_oaep;
 pub mod storage;
 pub mod types;
 pub mod unlock;

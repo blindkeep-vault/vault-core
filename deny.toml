@@ -1,4 +1,12 @@
 [advisories]
+ignore = [
+    # Marvin attack: timing side channel in `rsa` *decryption*. vault-core
+    # uses `rsa` (behind the `rsa-oaep` feature) for RSA-OAEP *encryption*
+    # only, which touches no private key; decryption runs in the recipient's
+    # KMS. Tests decrypt locally with fixture keys, which the advisory's own
+    # workaround ("local use") covers. No patched 0.9 release exists. #297
+    { id = "RUSTSEC-2023-0071", reason = "rsa used for OAEP encryption only; decryption happens in the recipient's KMS (#297)" },
+]
 
 [licenses]
 unused-allowed-license = "allow"

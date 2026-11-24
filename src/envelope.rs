@@ -4,6 +4,23 @@ use zeroize::Zeroizing;
 use crate::crypto::{decrypt_item, decrypt_item_auto, CryptoError};
 use crate::padding::unpad;
 
+/// Key-wrapping algorithm of one recipient entry in an envelope (#297).
+///
+/// Callers that seal one item to several recipients tag each recipient's
+/// wrapped key with the algorithm that produced it. The tag is an envelope
+/// field, not a database column. An entry without a tag is `x25519`, the only
+/// algorithm that existed before the tag did.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecipientAlgorithm {
+    /// X25519 ECDH + HKDF + XChaCha20-Poly1305 (SPECIFICATION.md §7.2).
+    #[default]
+    #[serde(rename = "x25519")]
+    X25519,
+    /// RSAES-OAEP-SHA-256 to a KMS-held key (SPECIFICATION.md §7.5.1).
+    #[serde(rename = "rsa-oaep-kms")]
+    RsaOaepKms,
+}
+
 /// Encrypted envelope format (compatible with web UI).
 /// The `name` field is the display name / secret label.
 /// The `content` field holds the secret value.
@@ -195,6 +212,23 @@ pub fn parse_envelope<'a>(data: &'a [u8], fallback_id: &str) -> (String, &'a [u8
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recipient_algorithm_wire_names() {
+        use super::RecipientAlgorithm;
+        assert_eq!(
+            serde_json::to_string(&RecipientAlgorithm::X25519).unwrap(),
+            r#""x25519""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RecipientAlgorithm::RsaOaepKms).unwrap(),
+            r#""rsa-oaep-kms""#
+        );
+        let parsed: RecipientAlgorithm = serde_json::from_str(r#""rsa-oaep-kms""#).unwrap();
+        assert_eq!(parsed, RecipientAlgorithm::RsaOaepKms);
+        assert!(serde_json::from_str::<RecipientAlgorithm>(r#""rsa-oaep""#).is_err());
+        assert_eq!(RecipientAlgorithm::default(), RecipientAlgorithm::X25519);
+    }
+
     use super::*;
 
     #[test]

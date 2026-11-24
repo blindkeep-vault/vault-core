@@ -28,8 +28,14 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+      - name: Clippy (rsa-oaep)
+        run: cargo clippy --features rsa-oaep -- -D warnings
+
       - name: Test
         run: cargo test
+
+      - name: Test (rsa-oaep)
+        run: cargo test --features rsa-oaep rsa_oaep
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked

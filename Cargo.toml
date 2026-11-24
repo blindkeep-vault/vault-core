@@ -30,6 +30,9 @@ thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# RSA-OAEP recipient (#297). Encryption only; see src/rsa_oaep.rs and the
+# RUSTSEC-2023-0071 entry in deny.toml.
+rsa = { version = "0.9", optional = true, default-features = false, features = ["std", "u64_digit", "sha2"] }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"], optional = true }
 
 [features]
@@ -37,3 +40,6 @@ default = ["drops", "server"]
 client = ["dep:hex"]
 drops = ["dep:bip39", "dep:hex", "dep:hmac", "dep:pbkdf2"]
 server = ["dep:jsonwebtoken"]
+# RSA-OAEP recipient variant (`rsa-oaep-kms`). Off by default so crates that
+# don't need it don't pull in `rsa` and its advisory.
+rsa-oaep = ["dep:rsa"]
